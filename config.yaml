@@ -1,0 +1,33 @@
+app_name: go-opcua-connector
+log_level: info
+
+opcua:
+  endpoint: opc.tcp://localhost:49320
+  certificate: ""
+  private_key: ""
+  username: ""
+  password: ""
+  security_policy: None
+  security_mode: None
+  connect_timeout: 30
+  request_timeout: 30
+
+nats:
+  urls: nats://192.168.0.69:4222
+  username: ""
+  password: ""
+  max_reconnects: -1
+  reconnect_wait_ms: 1000
+
+collector:
+  worker_count: 10
+  batch_size: 100
+  channel_buffer_size: 10000
+  publish_timeout_ms: 5000
+  subscription_topic: opcua/data
+  monitor_interval_sec: 60
+  stale_threshold_sec: 10
+  heartbeat_interval_sec: 5
+  subscription_nodes:
+    - ns=2;i=1
+    - ns=2;i=2
