@@ -1,3 +1,4 @@
+// Package nats provides NATS.io publishing capabilities for data points.
 package nats
 
 import (
@@ -22,20 +23,27 @@ import (
  * @author 王有政
  */
 type Publisher struct {
-	config       *config.NATSConfig
-	conn        *nats.Conn
-	logger      *zap.Logger
-	mu          sync.RWMutex
-	connected   atomic.Bool
-	publishSeq  atomic.Uint64
-	failCount   atomic.Uint64
+	// NATS配置
+	config *config.NATSConfig
+	// NATS底层连接
+	conn *nats.Conn
+	// 日志记录器
+	logger *zap.Logger
+	// 读写锁，保护连接和断开事件
+	mu sync.RWMutex
+	// 连接状态标识
+	connected atomic.Bool
+	// 发布序号（预留）
+	publishSeq atomic.Uint64
+	// 失败计数
+	failCount atomic.Uint64
+	// 成功计数
 	successCount atomic.Uint64
 }
 
 /**
  * 创建新的NATS发布者
  *
- * @author 王有政
  */
 func NewPublisher(cfg *config.NATSConfig, logger *zap.Logger) *Publisher {
 	return &Publisher{
@@ -47,7 +55,6 @@ func NewPublisher(cfg *config.NATSConfig, logger *zap.Logger) *Publisher {
 /**
  * 连接到NATS服务器
  *
- * @author 王有政
  */
 func (p *Publisher) Connect(ctx context.Context) error {
 	opts := []nats.Option{
@@ -88,7 +95,6 @@ func (p *Publisher) Connect(ctx context.Context) error {
 /**
  * 发布单个数据点到指定topic
  *
- * @author 王有政
  */
 func (p *Publisher) Publish(ctx context.Context, topic string, point model.DataPoint) error {
 	if !p.connected.Load() {
@@ -119,7 +125,6 @@ func (p *Publisher) Publish(ctx context.Context, topic string, point model.DataP
 /**
  * 批量发布数据点到指定topic
  *
- * @author 王有政
  */
 func (p *Publisher) PublishBatch(ctx context.Context, topic string, points []model.DataPoint) error {
 	if !p.connected.Load() {
@@ -157,7 +162,6 @@ func (p *Publisher) PublishBatch(ctx context.Context, topic string, points []mod
 /**
  * 获取发布统计信息
  *
- * @author 王有政
  */
 func (p *Publisher) GetStats() (success, fail uint64) {
 	return p.successCount.Load(), p.failCount.Load()
@@ -166,7 +170,6 @@ func (p *Publisher) GetStats() (success, fail uint64) {
 /**
  * 检查是否已连接
  *
- * @author 王有政
  */
 func (p *Publisher) IsConnected() bool {
 	return p.connected.Load()
@@ -175,7 +178,6 @@ func (p *Publisher) IsConnected() bool {
 /**
  * 关闭NATS连接
  *
- * @author 王有政
  */
 func (p *Publisher) Close() {
 	if p.conn != nil {

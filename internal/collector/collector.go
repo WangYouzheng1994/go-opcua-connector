@@ -1,7 +1,9 @@
+// Package collector implements the data collection engine with subscription + polling composite mode.
 package collector
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,32 +26,48 @@ import (
  * @author 王有政
  */
 type Collector struct {
-	config      *config.CollectorConfig
+	// 采集器配置
+	config *config.CollectorConfig
+	// OPC UA客户端
 	opcuaClient *opcua.Client
-	publisher   *nats.Publisher
-	logger      *zap.Logger
+	// NATS发布者
+	publisher *nats.Publisher
+	// 日志记录器
+	logger *zap.Logger
 
-	subCh    chan []model.DataPoint
-	pubCh    chan model.DataPoint
-	wg       sync.WaitGroup
-	ctx      context.Context
-	cancel   context.CancelFunc
+	// 订阅数据输入通道
+	subCh chan []model.DataPoint
+	// 发布数据输出通道
+	pubCh chan model.DataPoint
+	// 等待组，管理所有worker协程
+	wg sync.WaitGroup
+	// 根上下文
+	ctx context.Context
+	// 取消函数
+	cancel context.CancelFunc
 
-	nodeStates   map[string]*model.NodeDataState
+	// 节点数据状态表，key为NodeID
+	nodeStates map[string]*model.NodeDataState
+	// 保护nodeStates的读写锁
 	nodeStatesMu sync.RWMutex
 
-	stats       atomic.Value
-	startTime   time.Time
+	// 统计信息快照
+	stats atomic.Value
+	// 启动时间
+	startTime time.Time
+	// 累计点数
 	totalPoints atomic.Int64
+	// 成功计数
 	successCount atomic.Int64
-	failCount   atomic.Int64
-	staleCount  atomic.Int64
+	// 失败计数
+	failCount atomic.Int64
+	// 停滞计数
+	staleCount atomic.Int64
 }
 
 /**
  * 创建采集器实例
  *
- * @author 王有政
  */
 func New(
 	cfg *config.CollectorConfig,
@@ -58,14 +76,6 @@ func New(
 	logger *zap.Logger,
 ) *Collector {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	states := make(map[string]*model.NodeDataState)
-	for _, nodeID := range cfg.SubscriptionNodes {
-		states[nodeID] = &model.NodeDataState{
-			NodeID:     nodeID,
-			LastUpdate: time.Now().Add(-time.Hour),
-		}
-	}
 
 	return &Collector{
 		config:      cfg,
@@ -76,7 +86,7 @@ func New(
 		pubCh:      make(chan model.DataPoint, cfg.ChannelBufferSize),
 		ctx:         ctx,
 		cancel:      cancel,
-		nodeStates:  states,
+		nodeStates:  make(map[string]*model.NodeDataState),
 		startTime:   time.Now(),
 	}
 }
@@ -84,7 +94,6 @@ func New(
 /**
  * 启动采集器
  *
- * @author 王有政
  */
 func (c *Collector) Start() error {
 	c.logger.Info("Starting collector",
@@ -93,6 +102,24 @@ func (c *Collector) Start() error {
 		zap.Int("channel_buffer", c.config.ChannelBufferSize),
 		zap.Int("stale_threshold_sec", c.config.StaleThresholdSec),
 		zap.Int("heartbeat_interval_sec", c.config.HeartbeatIntervalSec))
+
+	resolvedNodes, err := c.opcuaClient.ResolveNodes(c.ctx, c.config.SubscriptionNodes)
+	if err != nil {
+		return fmt.Errorf("failed to resolve nodes: %w", err)
+	}
+
+	c.logger.Info("Nodes resolved",
+		zap.Int("configured_count", len(c.config.SubscriptionNodes)),
+		zap.Int("resolved_count", len(resolvedNodes)))
+
+	c.nodeStatesMu.Lock()
+	for _, nodeID := range resolvedNodes {
+		c.nodeStates[nodeID] = &model.NodeDataState{
+			NodeID:     nodeID,
+			LastUpdate: time.Now().Add(-time.Hour),
+		}
+	}
+	c.nodeStatesMu.Unlock()
 
 	for i := 0; i < c.config.WorkerCount; i++ {
 		c.wg.Add(1)
@@ -122,7 +149,7 @@ func (c *Collector) Start() error {
 		}
 	}
 
-	if err := c.opcuaClient.Subscribe(c.ctx, c.config.SubscriptionNodes, topic, handler); err != nil {
+	if err := c.opcuaClient.Subscribe(c.ctx, resolvedNodes, topic, handler); err != nil {
 		return err
 	}
 
@@ -136,7 +163,6 @@ func (c *Collector) Start() error {
 /**
  * 订阅数据处理worker
  *
- * @author 王有政
  */
 func (c *Collector) subWorker(id int) {
 	defer c.wg.Done()
@@ -166,7 +192,6 @@ func (c *Collector) subWorker(id int) {
 /**
  * 心跳验证worker - 定期拉取数据进行验证
  *
- * @author 王有政
  */
 func (c *Collector) heartbeatWorker() {
 	defer c.wg.Done()
@@ -191,8 +216,8 @@ func (c *Collector) heartbeatWorker() {
 
 /**
  * 执行心跳验证
+ * 验证成功后更新LastUpdate，避免stale检测误报
  *
- * @author 王有政
  */
 func (c *Collector) performHeartbeat() {
 	c.nodeStatesMu.RLock()
@@ -228,7 +253,11 @@ func (c *Collector) performHeartbeat() {
 		state.ReadValue = point.Value
 		state.ReadTimestamp = point.Timestamp
 
-		if point.Quality != "Good" && point.Quality != "Uncertain" {
+		if point.Quality == "Good" {
+			state.LastUpdate = time.Now()
+			c.logger.Debug("Heartbeat read quality good",
+				zap.String("node_id", point.NodeID))
+		} else {
 			c.logger.Warn("Heartbeat read quality bad",
 				zap.String("node_id", point.NodeID),
 				zap.String("quality", point.Quality))
@@ -239,7 +268,6 @@ func (c *Collector) performHeartbeat() {
 /**
  * 停滞检查worker - 检查数据是否停滞
  *
- * @author 王有政
  */
 func (c *Collector) staleCheckWorker() {
 	defer c.wg.Done()
@@ -267,7 +295,6 @@ func (c *Collector) staleCheckWorker() {
 /**
  * 检查停滞节点并发布Stale状态
  *
- * @author 王有政
  */
 func (c *Collector) checkStaleNodes(threshold time.Duration) {
 	c.nodeStatesMu.Lock()
@@ -307,7 +334,6 @@ func (c *Collector) checkStaleNodes(threshold time.Duration) {
 /**
  * 发布worker
  *
- * @author 王有政
  */
 func (c *Collector) publishWorker() {
 	defer c.wg.Done()
@@ -351,7 +377,6 @@ func (c *Collector) publishWorker() {
 /**
  * 更新节点状态
  *
- * @author 王有政
  */
 func (c *Collector) updateNodeState(point *model.DataPoint) {
 	c.nodeStatesMu.Lock()
@@ -373,7 +398,6 @@ func (c *Collector) updateNodeState(point *model.DataPoint) {
 /**
  * 处理一批数据
  *
- * @author 王有政
  */
 func (c *Collector) processBatch(batch []model.DataPoint) {
 	if len(batch) == 0 {
@@ -412,7 +436,6 @@ func (c *Collector) processBatch(batch []model.DataPoint) {
 /**
  * 刷新剩余批次
  *
- * @author 王有政
  */
 func (c *Collector) flushBatch(batch []model.DataPoint) {
 	if len(batch) > 0 {
@@ -423,7 +446,6 @@ func (c *Collector) flushBatch(batch []model.DataPoint) {
 /**
  * 监控统计信息
  *
- * @author 王有政
  */
 func (c *Collector) monitorStats() {
 	ticker := time.NewTicker(time.Duration(c.config.MonitorIntervalSec) * time.Second)
@@ -472,7 +494,6 @@ func (c *Collector) monitorStats() {
 /**
  * 获取统计信息
  *
- * @author 王有政
  */
 func (c *Collector) GetStats() *model.CollectorStats {
 	stats := c.stats.Load()
@@ -485,7 +506,6 @@ func (c *Collector) GetStats() *model.CollectorStats {
 /**
  * 停止采集器
  *
- * @author 王有政
  */
 func (c *Collector) Stop() {
 	c.logger.Info("Stopping collector...")

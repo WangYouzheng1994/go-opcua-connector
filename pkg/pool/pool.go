@@ -1,10 +1,15 @@
+// Package pool provides generic object pool implementations to reduce GC pressure.
 package pool
 
 import (
 	"sync"
 )
 
-// Pool /**
+/**
+ * 通用对象池接口
+ *
+ * @author 王有政
+ */
 type Pool[T any] interface {
 	Get() T
 	Put(T)
@@ -16,14 +21,15 @@ type Pool[T any] interface {
  * @author 王有政
  */
 type genericPool[T any] struct {
-	pool  sync.Pool
+	// 底层sync.Pool
+	pool sync.Pool
+	// 创建新对象的工厂函数
 	newFn func() T
 }
 
 /**
  * 创建一个新的对象池
  *
- * @author 王有政
  */
 func New[T any](newFn func() T) Pool[T] {
 	return &genericPool[T]{
@@ -39,7 +45,6 @@ func New[T any](newFn func() T) Pool[T] {
 /**
  * 获取一个对象
  *
- * @author 王有政
  */
 func (p *genericPool[T]) Get() T {
 	return p.pool.Get().(T)
@@ -48,7 +53,6 @@ func (p *genericPool[T]) Get() T {
 /**
  * 归还一个对象
  *
- * @author 王有政
  */
 func (p *genericPool[T]) Put(obj T) {
 	p.pool.Put(obj)
@@ -60,14 +64,15 @@ func (p *genericPool[T]) Put(obj T) {
  * @author 王有政
  */
 type BytePool struct {
+	// 底层sync.Pool
 	pool sync.Pool
+	// 缓冲区大小
 	size int
 }
 
 /**
  * 创建字节缓冲区池
  *
- * @author 王有政
  */
 func NewBytePool(size int) *BytePool {
 	return &BytePool{
@@ -84,7 +89,6 @@ func NewBytePool(size int) *BytePool {
 /**
  * 获取缓冲区
  *
- * @author 王有政
  */
 func (p *BytePool) Get() *[]byte {
 	buf := p.pool.Get().(*[]byte)
@@ -94,7 +98,6 @@ func (p *BytePool) Get() *[]byte {
 /**
  * 归还缓冲区
  *
- * @author 王有政
  */
 func (p *BytePool) Put(buf *[]byte) {
 	if cap(*buf) == p.size {
@@ -108,14 +111,15 @@ func (p *BytePool) Put(buf *[]byte) {
  * @author 王有政
  */
 type SlicePool[T any] struct {
+	// 底层sync.Pool
 	pool sync.Pool
+	// 切片初始容量
 	size int
 }
 
 /**
  * 创建切片池
  *
- * @author 王有政
  */
 func NewSlicePool[T any](size int) *SlicePool[T] {
 	return &SlicePool[T]{
@@ -132,7 +136,6 @@ func NewSlicePool[T any](size int) *SlicePool[T] {
 /**
  * 获取切片
  *
- * @author 王有政
  */
 func (p *SlicePool[T]) Get() *[]T {
 	s := p.pool.Get().(*[]T)
@@ -143,7 +146,6 @@ func (p *SlicePool[T]) Get() *[]T {
 /**
  * 归还切片
  *
- * @author 王有政
  */
 func (p *SlicePool[T]) Put(s *[]T) {
 	if cap(*s) == p.size {

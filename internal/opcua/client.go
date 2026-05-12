@@ -1,9 +1,11 @@
+// Package opcua provides OPC UA client management including connection, subscription, and data reading.
 package opcua
 
 import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"go-opcua-connector/internal/config"
 	"go-opcua-connector/internal/model"
@@ -20,10 +22,14 @@ import (
  * @author 王有政
  */
 type Client struct {
+	// OPC UA配置
 	config *config.OPCUAConfig
+	// gopcua底层客户端
 	client *opcua.Client
+	// 日志记录器
 	logger *zap.Logger
-	mu     sync.RWMutex
+	// 读写锁，保护连接状态和客户端实例
+	mu sync.RWMutex
 }
 
 /**
@@ -34,9 +40,24 @@ type Client struct {
 type DataChangeHandler func(points []model.DataPoint)
 
 /**
+ * 将StatusCode映射为简洁的品质字符串
+ * OPC UA规范：Good=0x00, Uncertain=0x40, Bad=0x80
+ *
+ */
+func qualityString(status ua.StatusCode) string {
+	switch status & 0xC0000000 {
+	case 0x00000000:
+		return "Good"
+	case 0x40000000:
+		return "Uncertain"
+	default:
+		return "Bad"
+	}
+}
+
+/**
  * 创建新的OPC UA客户端
  *
- * @author 王有政
  */
 func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 	return &Client{
@@ -48,7 +69,6 @@ func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 /**
  * 连接到OPC UA服务器
  *
- * @author 王有政
  */
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
@@ -84,7 +104,6 @@ func (c *Client) Connect(ctx context.Context) error {
 /**
  * 创建订阅并注册监控项
  *
- * @author 王有政
  */
 func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, handler DataChangeHandler) error {
 	if c.client == nil {
@@ -109,7 +128,7 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 		monitorItems[i] = opcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, uint32(i))
 	}
 
-	go c.handleNotifications(sub, notificationCh, topic, handler)
+	go c.handleNotifications(sub, notificationCh, topic, handler, nodes)
 
 	_, err = sub.Monitor(ctx, ua.TimestampsToReturnBoth, monitorItems...)
 	if err != nil {
@@ -124,15 +143,16 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 }
 
 /**
- * 处理通知数据
+ * 处理OPC UA订阅通知数据
+ * 解析DataChangeNotification，通过ClientHandle映射回NodeID
  *
- * @author 王有政
  */
 func (c *Client) handleNotifications(
 	sub *opcua.Subscription,
 	notificationCh chan *opcua.PublishNotificationData,
 	topic string,
 	handler DataChangeHandler,
+	nodes []string,
 ) {
 	for {
 		select {
@@ -146,14 +166,46 @@ func (c *Client) handleNotifications(
 				continue
 			}
 
-			point := model.DataPoint{
-				NodeID:    "unknown",
-				Value:     notification,
-				Quality:   "Good",
-				Topic:     topic,
+			if notification.Value == nil {
+				continue
 			}
 
-			handler([]model.DataPoint{point})
+			data, ok := notification.Value.(*ua.DataChangeNotification)
+			if !ok {
+				continue
+			}
+
+			points := make([]model.DataPoint, 0, len(data.MonitoredItems))
+			for _, item := range data.MonitoredItems {
+				nodeID := "unknown"
+				if int(item.ClientHandle) < len(nodes) {
+					nodeID = nodes[item.ClientHandle]
+				}
+
+				dp := model.DataPoint{
+					NodeID: nodeID,
+					Topic:  topic,
+				}
+
+				if item.Value != nil {
+					if item.Value.Value != nil {
+						dp.Value = item.Value.Value.Value()
+					}
+					dp.Quality = qualityString(item.Value.Status)
+					if !item.Value.ServerTimestamp.IsZero() {
+						dp.Timestamp = item.Value.ServerTimestamp
+					}
+				} else {
+					dp.Quality = "BadNoValue"
+					dp.Timestamp = time.Now()
+				}
+
+				points = append(points, dp)
+			}
+
+			if len(points) > 0 {
+				handler(points)
+			}
 		}
 	}
 }
@@ -161,7 +213,6 @@ func (c *Client) handleNotifications(
 /**
  * 关闭客户端连接
  *
- * @author 王有政
  */
 func (c *Client) Close() {
 	c.mu.Lock()
@@ -178,7 +229,6 @@ func (c *Client) Close() {
 /**
  * 解析安全模式配置
  *
- * @author 王有政
  */
 func (c *Client) parseSecurityMode() ua.MessageSecurityMode {
 	switch c.config.SecurityMode {
@@ -194,7 +244,6 @@ func (c *Client) parseSecurityMode() ua.MessageSecurityMode {
 /**
  * 检查连接状态
  *
- * @author 王有政
  */
 func (c *Client) IsConnected() bool {
 	c.mu.RLock()
@@ -203,9 +252,79 @@ func (c *Client) IsConnected() bool {
 }
 
 /**
+ * 解析配置节点列表，自动展开文件夹节点为叶子变量节点
+ * 对每个配置节点尝试Browse子节点：
+ * - 有Variable子节点 → 展开为子节点列表
+ * - 无子节点 → 视为叶子节点，直接保留
+ *
+ */
+func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	resolved := make([]string, 0, len(nodeIDs))
+
+	for _, nodeID := range nodeIDs {
+		id, err := ua.ParseNodeID(nodeID)
+		if err != nil {
+			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", nodeID), zap.Error(err))
+			continue
+		}
+
+		leaves, err := c.browseVariableLeaves(ctx, id)
+		if err != nil {
+			c.logger.Warn("Failed to browse node, using as-is",
+				zap.String("node_id", nodeID), zap.Error(err))
+			resolved = append(resolved, nodeID)
+			continue
+		}
+
+		if len(leaves) == 0 {
+			resolved = append(resolved, nodeID)
+		} else {
+			c.logger.Info("Node expanded to leaf variables",
+				zap.String("folder_node", nodeID),
+				zap.Int("leaf_count", len(leaves)))
+			resolved = append(resolved, leaves...)
+		}
+	}
+
+	return resolved, nil
+}
+
+/**
+ * 递归浏览节点的子节点，收集所有叶子Variable类型节点的NodeID
+ * 仅取当前层级的Variable子节点，不递归进入Object子文件夹
+ * 避免纳入_Hints等KepServer元数据节点
+ *
+ */
+func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
+	node := c.client.Node(nodeID)
+
+	refs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
+	if err != nil {
+		return nil, err
+	}
+
+	leaves := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
+		if childNode == nil || childNode.ID == nil {
+			continue
+		}
+		leaves = append(leaves, childNode.ID.String())
+	}
+
+	return leaves, nil
+}
+
+/**
  * 读取单个节点的值（主动拉取）
  *
- * @author 王有政
  */
 func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, error) {
 	c.mu.RLock()
@@ -244,9 +363,11 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 	result := resp.Results[0]
 	point := &model.DataPoint{
 		NodeID:    nodeID,
-		Value:     result.Value,
-		Quality:   fmt.Sprintf("%v", result.Status),
+		Quality:   qualityString(result.Status),
 		Timestamp: result.ServerTimestamp,
+	}
+	if result.Value != nil {
+		point.Value = result.Value.Value()
 	}
 
 	return point, nil
@@ -255,7 +376,6 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 /**
  * 批量读取多个节点的值（主动拉取，用于心跳验证）
  *
- * @author 王有政
  */
 func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoint, error) {
 	c.mu.RLock()
@@ -307,9 +427,11 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 		result := resp.Results[i]
 		point := model.DataPoint{
 			NodeID:    nodeID,
-			Value:     result.Value,
-			Quality:   fmt.Sprintf("%v", result.Status),
+			Quality:   qualityString(result.Status),
 			Timestamp: result.ServerTimestamp,
+		}
+		if result.Value != nil {
+			point.Value = result.Value.Value()
 		}
 		points = append(points, point)
 	}

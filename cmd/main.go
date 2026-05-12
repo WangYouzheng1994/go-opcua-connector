@@ -1,3 +1,4 @@
+// Command go-opcua-connector connects to OPC UA servers, collects data points, and forwards them to NATS.io.
 package main
 
 import (
@@ -19,8 +20,6 @@ import (
 
 /**
  * 主程序入口
- *
- * @author 王有政
  */
 func main() {
 	logger := initLogger()
@@ -45,9 +44,10 @@ func main() {
 
 	publisher := nats.NewPublisher(&cfg.NATS, logger)
 	if err := publisher.Connect(ctx); err != nil {
-		logger.Fatal("Failed to connect to NATS", zap.Error(err))
+		logger.Warn("Failed to connect to NATS, continuing without NATS", zap.Error(err))
+	} else {
+		defer publisher.Close()
 	}
-	defer publisher.Close()
 
 	col := collector.New(&cfg.Collector, opcuaClient, publisher, logger)
 	if err := col.Start(); err != nil {
