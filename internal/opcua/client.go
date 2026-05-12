@@ -15,35 +15,23 @@ import (
 	"go.uber.org/zap"
 )
 
-/**
- * OPC UA客户端管理器
- * 负责与OPC UA服务器的连接、订阅管理
- *
- * @author 王有政
- */
+// Client OPC UA客户端管理器，负责与OPC UA服务器的连接、订阅管理
 type Client struct {
-	// OPC UA配置
+	// config OPC UA配置
 	config *config.OPCUAConfig
-	// gopcua底层客户端
+	// client gopcua底层客户端
 	client *opcua.Client
-	// 日志记录器
+	// logger 日志记录器
 	logger *zap.Logger
-	// 读写锁，保护连接状态和客户端实例
+	// mu 读写锁，保护连接状态和客户端实例
 	mu sync.RWMutex
 }
 
-/**
- * 回调函数类型，用于处理数据变化
- *
- * @author 王有政
- */
+// DataChangeHandler 回调函数类型，用于处理数据变化
 type DataChangeHandler func(points []model.DataPoint)
 
-/**
- * 将StatusCode映射为简洁的品质字符串
- * OPC UA规范：Good=0x00, Uncertain=0x40, Bad=0x80
- *
- */
+// qualityString 将StatusCode映射为简洁的品质字符串
+// OPC UA规范：Good=0x00, Uncertain=0x40, Bad=0x80
 func qualityString(status ua.StatusCode) string {
 	switch status & 0xC0000000 {
 	case 0x00000000:
@@ -55,10 +43,7 @@ func qualityString(status ua.StatusCode) string {
 	}
 }
 
-/**
- * 创建新的OPC UA客户端
- *
- */
+// NewClient 创建新的OPC UA客户端
 func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 	return &Client{
 		config: cfg,
@@ -66,10 +51,7 @@ func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 	}
 }
 
-/**
- * 连接到OPC UA服务器
- *
- */
+// Connect 连接到OPC UA服务器
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -101,10 +83,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-/**
- * 创建订阅并注册监控项
- *
- */
+// Subscribe 创建订阅并注册监控项
 func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, handler DataChangeHandler) error {
 	if c.client == nil {
 		return fmt.Errorf("client not connected, call Connect() first")
@@ -142,11 +121,8 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 	return nil
 }
 
-/**
- * 处理OPC UA订阅通知数据
- * 解析DataChangeNotification，通过ClientHandle映射回NodeID
- *
- */
+// handleNotifications 处理OPC UA订阅通知数据
+// 解析DataChangeNotification，通过ClientHandle映射回NodeID
 func (c *Client) handleNotifications(
 	sub *opcua.Subscription,
 	notificationCh chan *opcua.PublishNotificationData,
@@ -210,10 +186,7 @@ func (c *Client) handleNotifications(
 	}
 }
 
-/**
- * 关闭客户端连接
- *
- */
+// Close 关闭客户端连接
 func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -226,10 +199,7 @@ func (c *Client) Close() {
 	c.logger.Info("OPC UA client closed")
 }
 
-/**
- * 解析安全模式配置
- *
- */
+// parseSecurityMode 解析安全模式配置
 func (c *Client) parseSecurityMode() ua.MessageSecurityMode {
 	switch c.config.SecurityMode {
 	case "Sign":
@@ -241,23 +211,17 @@ func (c *Client) parseSecurityMode() ua.MessageSecurityMode {
 	}
 }
 
-/**
- * 检查连接状态
- *
- */
+// IsConnected 检查连接状态
 func (c *Client) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.client != nil
 }
 
-/**
- * 解析配置节点列表，自动展开文件夹节点为叶子变量节点
- * 对每个配置节点尝试Browse子节点：
- * - 有Variable子节点 → 展开为子节点列表
- * - 无子节点 → 视为叶子节点，直接保留
- *
- */
+// ResolveNodes 解析配置节点列表，自动展开文件夹节点为叶子变量节点
+// 对每个配置节点尝试Browse子节点：
+// - 有Variable子节点 → 展开为子节点列表
+// - 无子节点 → 视为叶子节点，直接保留
 func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -296,12 +260,9 @@ func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, 
 	return resolved, nil
 }
 
-/**
- * 递归浏览节点的子节点，收集所有叶子Variable类型节点的NodeID
- * 仅取当前层级的Variable子节点，不递归进入Object子文件夹
- * 避免纳入_Hints等KepServer元数据节点
- *
- */
+// browseVariableLeaves 递归浏览节点的子节点，收集所有叶子Variable类型节点的NodeID
+// 仅取当前层级的Variable子节点，不递归进入Object子文件夹
+// 避免纳入_Hints等KepServer元数据节点
 func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
 	node := c.client.Node(nodeID)
 
@@ -322,10 +283,7 @@ func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([
 	return leaves, nil
 }
 
-/**
- * 读取单个节点的值（主动拉取）
- *
- */
+// Read 读取单个节点的值（主动拉取）
 func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -373,10 +331,7 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 	return point, nil
 }
 
-/**
- * 批量读取多个节点的值（主动拉取，用于心跳验证）
- *
- */
+// ReadAll 批量读取多个节点的值（主动拉取，用于心跳验证）
 func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoint, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()

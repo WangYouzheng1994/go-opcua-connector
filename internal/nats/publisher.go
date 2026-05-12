@@ -16,35 +16,27 @@ import (
 	"go.uber.org/zap"
 )
 
-/**
- * NATS发布者
- * 负责将数据点发布到NATS.io
- *
- * @author 王有政
- */
+// Publisher NATS发布者，负责将数据点发布到NATS.io
 type Publisher struct {
-	// NATS配置
+	// config NATS配置
 	config *config.NATSConfig
-	// NATS底层连接
+	// conn NATS底层连接
 	conn *nats.Conn
-	// 日志记录器
+	// logger 日志记录器
 	logger *zap.Logger
-	// 读写锁，保护连接和断开事件
+	// mu 读写锁，保护连接和断开事件
 	mu sync.RWMutex
-	// 连接状态标识
+	// connected 连接状态标识
 	connected atomic.Bool
-	// 发布序号（预留）
+	// publishSeq 发布序号（预留）
 	publishSeq atomic.Uint64
-	// 失败计数
+	// failCount 失败计数
 	failCount atomic.Uint64
-	// 成功计数
+	// successCount 成功计数
 	successCount atomic.Uint64
 }
 
-/**
- * 创建新的NATS发布者
- *
- */
+// NewPublisher 创建新的NATS发布者
 func NewPublisher(cfg *config.NATSConfig, logger *zap.Logger) *Publisher {
 	return &Publisher{
 		config: cfg,
@@ -52,10 +44,7 @@ func NewPublisher(cfg *config.NATSConfig, logger *zap.Logger) *Publisher {
 	}
 }
 
-/**
- * 连接到NATS服务器
- *
- */
+// Connect 连接到NATS服务器
 func (p *Publisher) Connect(ctx context.Context) error {
 	opts := []nats.Option{
 		nats.Name("go-opcua-connector"),
@@ -92,10 +81,7 @@ func (p *Publisher) Connect(ctx context.Context) error {
 	return nil
 }
 
-/**
- * 发布单个数据点到指定topic
- *
- */
+// Publish 发布单个数据点到指定topic
 func (p *Publisher) Publish(ctx context.Context, topic string, point model.DataPoint) error {
 	if !p.connected.Load() {
 		return fmt.Errorf("not connected to NATS")
@@ -122,10 +108,7 @@ func (p *Publisher) Publish(ctx context.Context, topic string, point model.DataP
 	return nil
 }
 
-/**
- * 批量发布数据点到指定topic
- *
- */
+// PublishBatch 批量发布数据点到指定topic
 func (p *Publisher) PublishBatch(ctx context.Context, topic string, points []model.DataPoint) error {
 	if !p.connected.Load() {
 		return fmt.Errorf("not connected to NATS")
@@ -159,26 +142,17 @@ func (p *Publisher) PublishBatch(ctx context.Context, topic string, points []mod
 	return nil
 }
 
-/**
- * 获取发布统计信息
- *
- */
+// GetStats 获取发布统计信息
 func (p *Publisher) GetStats() (success, fail uint64) {
 	return p.successCount.Load(), p.failCount.Load()
 }
 
-/**
- * 检查是否已连接
- *
- */
+// IsConnected 检查是否已连接
 func (p *Publisher) IsConnected() bool {
 	return p.connected.Load()
 }
 
-/**
- * 关闭NATS连接
- *
- */
+// Close 关闭NATS连接
 func (p *Publisher) Close() {
 	if p.conn != nil {
 		p.conn.Close()

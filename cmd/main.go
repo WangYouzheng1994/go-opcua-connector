@@ -18,9 +18,7 @@ import (
 	"go.uber.org/zap/zapcore"
 )
 
-/**
- * 主程序入口
- */
+// main 主程序入口
 func main() {
 	logger := initLogger()
 	defer logger.Sync()

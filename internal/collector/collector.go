@@ -16,59 +16,52 @@ import (
 	"go.uber.org/zap"
 )
 
-/**
- * 数据采集器
- * 订阅+拉取复合模式：
- * - 订阅：实时接收数据变化
- * - 拉取：定期心跳验证
- * - 合并：统一判定Quality后发布到NATS
- *
- * @author 王有政
- */
+// Collector 数据采集器
+// 订阅+拉取复合模式：
+// - 订阅：实时接收数据变化
+// - 拉取：定期心跳验证
+// - 合并：统一判定Quality后发布到NATS
 type Collector struct {
-	// 采集器配置
+	// config 采集器配置
 	config *config.CollectorConfig
-	// OPC UA客户端
+	// opcuaClient OPC UA客户端
 	opcuaClient *opcua.Client
-	// NATS发布者
+	// publisher NATS发布者
 	publisher *nats.Publisher
-	// 日志记录器
+	// logger 日志记录器
 	logger *zap.Logger
 
-	// 订阅数据输入通道
+	// subCh 订阅数据输入通道
 	subCh chan []model.DataPoint
-	// 发布数据输出通道
+	// pubCh 发布数据输出通道
 	pubCh chan model.DataPoint
-	// 等待组，管理所有worker协程
+	// wg 等待组，管理所有worker协程
 	wg sync.WaitGroup
-	// 根上下文
+	// ctx 根上下文
 	ctx context.Context
-	// 取消函数
+	// cancel 取消函数
 	cancel context.CancelFunc
 
-	// 节点数据状态表，key为NodeID
+	// nodeStates 节点数据状态表，key为NodeID
 	nodeStates map[string]*model.NodeDataState
-	// 保护nodeStates的读写锁
+	// nodeStatesMu 保护nodeStates的读写锁
 	nodeStatesMu sync.RWMutex
 
-	// 统计信息快照
+	// stats 统计信息快照
 	stats atomic.Value
-	// 启动时间
+	// startTime 启动时间
 	startTime time.Time
-	// 累计点数
+	// totalPoints 累计点数
 	totalPoints atomic.Int64
-	// 成功计数
+	// successCount 成功计数
 	successCount atomic.Int64
-	// 失败计数
+	// failCount 失败计数
 	failCount atomic.Int64
-	// 停滞计数
+	// staleCount 停滞计数
 	staleCount atomic.Int64
 }
 
-/**
- * 创建采集器实例
- *
- */
+// New 创建采集器实例
 func New(
 	cfg *config.CollectorConfig,
 	opcuaClient *opcua.Client,
@@ -91,10 +84,7 @@ func New(
 	}
 }
 
-/**
- * 启动采集器
- *
- */
+// Start 启动采集器
 func (c *Collector) Start() error {
 	c.logger.Info("Starting collector",
 		zap.Int("worker_count", c.config.WorkerCount),
@@ -160,10 +150,7 @@ func (c *Collector) Start() error {
 	return nil
 }
 
-/**
- * 订阅数据处理worker
- *
- */
+// subWorker 订阅数据处理worker
 func (c *Collector) subWorker(id int) {
 	defer c.wg.Done()
 
@@ -189,10 +176,7 @@ func (c *Collector) subWorker(id int) {
 	}
 }
 
-/**
- * 心跳验证worker - 定期拉取数据进行验证
- *
- */
+// heartbeatWorker 心跳验证worker - 定期拉取数据进行验证
 func (c *Collector) heartbeatWorker() {
 	defer c.wg.Done()
 
@@ -214,11 +198,7 @@ func (c *Collector) heartbeatWorker() {
 	}
 }
 
-/**
- * 执行心跳验证
- * 验证成功后更新LastUpdate，避免stale检测误报
- *
- */
+// performHeartbeat 执行心跳验证，验证成功后更新LastUpdate，避免stale检测误报
 func (c *Collector) performHeartbeat() {
 	c.nodeStatesMu.RLock()
 	nodeIDs := make([]string, 0, len(c.nodeStates))
@@ -265,10 +245,7 @@ func (c *Collector) performHeartbeat() {
 	}
 }
 
-/**
- * 停滞检查worker - 检查数据是否停滞
- *
- */
+// staleCheckWorker 停滞检查worker - 检查数据是否停滞
 func (c *Collector) staleCheckWorker() {
 	defer c.wg.Done()
 
@@ -292,10 +269,7 @@ func (c *Collector) staleCheckWorker() {
 	}
 }
 
-/**
- * 检查停滞节点并发布Stale状态
- *
- */
+// checkStaleNodes 检查停滞节点并发布Stale状态
 func (c *Collector) checkStaleNodes(threshold time.Duration) {
 	c.nodeStatesMu.Lock()
 	defer c.nodeStatesMu.Unlock()
@@ -331,10 +305,7 @@ func (c *Collector) checkStaleNodes(threshold time.Duration) {
 	}
 }
 
-/**
- * 发布worker
- *
- */
+// publishWorker 发布worker
 func (c *Collector) publishWorker() {
 	defer c.wg.Done()
 
@@ -374,10 +345,7 @@ func (c *Collector) publishWorker() {
 	}
 }
 
-/**
- * 更新节点状态
- *
- */
+// updateNodeState 更新节点状态
 func (c *Collector) updateNodeState(point *model.DataPoint) {
 	c.nodeStatesMu.Lock()
 	defer c.nodeStatesMu.Unlock()
@@ -395,10 +363,7 @@ func (c *Collector) updateNodeState(point *model.DataPoint) {
 	state.LastUpdate = time.Now()
 }
 
-/**
- * 处理一批数据
- *
- */
+// processBatch 处理一批数据
 func (c *Collector) processBatch(batch []model.DataPoint) {
 	if len(batch) == 0 {
 		return
@@ -433,20 +398,14 @@ func (c *Collector) processBatch(batch []model.DataPoint) {
 	}
 }
 
-/**
- * 刷新剩余批次
- *
- */
+// flushBatch 刷新剩余批次
 func (c *Collector) flushBatch(batch []model.DataPoint) {
 	if len(batch) > 0 {
 		c.processBatch(batch)
 	}
 }
 
-/**
- * 监控统计信息
- *
- */
+// monitorStats 监控统计信息
 func (c *Collector) monitorStats() {
 	ticker := time.NewTicker(time.Duration(c.config.MonitorIntervalSec) * time.Second)
 	defer ticker.Stop()
@@ -491,10 +450,7 @@ func (c *Collector) monitorStats() {
 	}
 }
 
-/**
- * 获取统计信息
- *
- */
+// GetStats 获取统计信息
 func (c *Collector) GetStats() *model.CollectorStats {
 	stats := c.stats.Load()
 	if stats != nil {
@@ -503,10 +459,7 @@ func (c *Collector) GetStats() *model.CollectorStats {
 	return nil
 }
 
-/**
- * 停止采集器
- *
- */
+// Stop 停止采集器
 func (c *Collector) Stop() {
 	c.logger.Info("Stopping collector...")
 	c.cancel()

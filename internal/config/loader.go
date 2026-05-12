@@ -8,21 +8,15 @@ import (
 	"github.com/spf13/viper"
 )
 
-/**
- * 配置加载器
- *
- * @author 王有政
- */
+// Loader 配置加载器
 type Loader struct {
-	// 配置文件搜索路径
+	// configPath 配置文件搜索路径
 	configPath string
-	// 配置文件名称（不含扩展名）
+	// configName 配置文件名称（不含扩展名）
 	configName string
 }
 
-/**
- * 创建配置加载器实例
- */
+// NewLoader 创建配置加载器实例
 func NewLoader(configPath, configName string) *Loader {
 	return &Loader{
 		configPath: configPath,
@@ -30,9 +24,7 @@ func NewLoader(configPath, configName string) *Loader {
 	}
 }
 
-/**
- * 加载并解析配置文件，绑定环境变量覆盖，返回应用配置
- */
+// Load 加载并解析配置文件，绑定环境变量覆盖，返回应用配置
 func (l *Loader) Load() (*AppConfig, error) {
 	v := viper.New()
 
