@@ -4,6 +4,8 @@ package opcua
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +69,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		opts = append(opts, opcua.AuthUsername(c.config.Username, c.config.Password))
 	}
 
+	// 初始化opcua的客户端
 	client, err := opcua.NewClient(endpoint, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
@@ -220,8 +223,9 @@ func (c *Client) IsConnected() bool {
 
 // ResolveNodes 解析配置节点列表，自动展开文件夹节点为叶子变量节点
 // 对每个配置节点尝试Browse子节点：
-// - 有Variable子节点 → 展开为子节点列表
-// - 无子节点 → 视为叶子节点，直接保留
+// - 无Variable子节点 → 视为叶子节点，直接保留
+// - 有Variable子节点（精确模式） → 展开为直接子节点列表
+// - 有Variable子节点（通配模式.*） → 穿透Object子文件夹，递归收集所有叶子
 func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -232,26 +236,42 @@ func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, 
 
 	resolved := make([]string, 0, len(nodeIDs))
 
-	for _, nodeID := range nodeIDs {
-		id, err := ua.ParseNodeID(nodeID)
+	for _, rawNodeID := range nodeIDs {
+		recursive := false
+		cleanNodeID := rawNodeID
+
+		// 检测.*通配符后缀，决定是否递归穿透Object文件夹
+		if strings.HasSuffix(rawNodeID, ".*") {
+			recursive = true
+			cleanNodeID = rawNodeID[:len(rawNodeID)-2]
+		}
+
+		id, err := ua.ParseNodeID(cleanNodeID)
 		if err != nil {
-			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", nodeID), zap.Error(err))
+			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", rawNodeID), zap.Error(err))
 			continue
 		}
 
-		leaves, err := c.browseVariableLeaves(ctx, id)
+		var leaves []string
+		if recursive {
+			leaves, err = c.browseAllLeaves(ctx, id)
+		} else {
+			leaves, err = c.browseVariableLeaves(ctx, id)
+		}
+
 		if err != nil {
 			c.logger.Warn("Failed to browse node, using as-is",
-				zap.String("node_id", nodeID), zap.Error(err))
-			resolved = append(resolved, nodeID)
+				zap.String("node_id", rawNodeID), zap.Error(err))
+			resolved = append(resolved, cleanNodeID)
 			continue
 		}
 
 		if len(leaves) == 0 {
-			resolved = append(resolved, nodeID)
+			resolved = append(resolved, cleanNodeID)
 		} else {
 			c.logger.Info("Node expanded to leaf variables",
-				zap.String("folder_node", nodeID),
+				zap.String("folder_node", rawNodeID),
+				zap.Bool("recursive", recursive),
 				zap.Int("leaf_count", len(leaves)))
 			resolved = append(resolved, leaves...)
 		}
@@ -260,9 +280,7 @@ func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, 
 	return resolved, nil
 }
 
-// browseVariableLeaves 递归浏览节点的子节点，收集所有叶子Variable类型节点的NodeID
-// 仅取当前层级的Variable子节点，不递归进入Object子文件夹
-// 避免纳入_Hints等KepServer元数据节点
+// browseVariableLeaves 浏览节点的直接Variable子节点，仅取当前层级
 func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
 	node := c.client.Node(nodeID)
 
@@ -278,6 +296,53 @@ func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([
 			continue
 		}
 		leaves = append(leaves, childNode.ID.String())
+	}
+
+	return leaves, nil
+}
+
+// browseAllLeaves 递归浏览节点及其所有Object子文件夹，收集所有叶子Variable类型节点的NodeID
+// 跳过_开头的KepServer元数据节点
+func (c *Client) browseAllLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
+	node := c.client.Node(nodeID)
+
+	// 收集当前层级的Variable子节点
+	varRefs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
+	if err != nil {
+		return nil, err
+	}
+
+	leaves := make([]string, 0)
+	for _, ref := range varRefs {
+		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
+		if childNode == nil || childNode.ID == nil {
+			continue
+		}
+		leaves = append(leaves, childNode.ID.String())
+	}
+
+	// 递归进入Object子文件夹，跳过_开头的KepServer元数据节点
+	objRefs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassObject, true)
+	if err != nil {
+		return leaves, nil
+	}
+
+	for _, ref := range objRefs {
+		if strings.HasPrefix(ref.BrowseName.Name, "_") {
+			continue
+		}
+		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
+		if childNode == nil || childNode.ID == nil {
+			continue
+		}
+		childLeaves, err := c.browseAllLeaves(ctx, childNode.ID)
+		if err != nil {
+			c.logger.Warn("Failed to browse child folder, skipping",
+				zap.String("node_id", childNode.ID.String()),
+				zap.Error(err))
+			continue
+		}
+		leaves = append(leaves, childLeaves...)
 	}
 
 	return leaves, nil
@@ -300,10 +365,10 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 	req := &ua.ReadRequest{
 		NodesToRead: []*ua.ReadValueID{
 			{
-				NodeID:          id,
-				AttributeID:     ua.AttributeIDValue,
-				IndexRange:      "",
-				DataEncoding:    nil,
+				NodeID:       id,
+				AttributeID:  ua.AttributeIDValue,
+				IndexRange:   "",
+				DataEncoding: nil,
 			},
 		},
 		TimestampsToReturn: ua.TimestampsToReturnBoth,
@@ -364,7 +429,7 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 	}
 
 	req := &ua.ReadRequest{
-		NodesToRead:         nodesToRead,
+		NodesToRead:        nodesToRead,
 		TimestampsToReturn: ua.TimestampsToReturnBoth,
 	}
 
@@ -392,4 +457,154 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 	}
 
 	return points, nil
+}
+
+// Write 向OPC UA服务器单个节点写入值
+func (c *Client) Write(ctx context.Context, nodeID string, value any) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return fmt.Errorf("client not connected")
+	}
+
+	id, err := ua.ParseNodeID(nodeID)
+	if err != nil {
+		return fmt.Errorf("invalid node ID: %w", err)
+	}
+
+	variant, err := ua.NewVariant(value)
+	if err != nil {
+		return fmt.Errorf("failed to create variant: %w", err)
+	}
+
+	req := &ua.WriteRequest{
+		NodesToWrite: []*ua.WriteValue{
+			{
+				NodeID:      id,
+				AttributeID: ua.AttributeIDValue,
+				Value: &ua.DataValue{
+					Value: variant,
+				},
+			},
+		},
+	}
+
+	resp, err := c.client.Write(ctx, req)
+	if err != nil {
+		return fmt.Errorf("write failed: %w", err)
+	}
+
+	if len(resp.Results) > 0 && resp.Results[0] != ua.StatusOK {
+		return fmt.Errorf("write rejected: %s", resp.Results[0])
+	}
+
+	return nil
+}
+
+// WriteAll 批量向OPC UA服务器写入值，每项含NodeID和对应值
+func (c *Client) WriteAll(ctx context.Context, items map[string]any) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if c.client == nil {
+		return fmt.Errorf("client not connected")
+	}
+
+	nodesToWrite := make([]*ua.WriteValue, 0, len(items))
+	for nodeID, value := range items {
+		id, err := ua.ParseNodeID(nodeID)
+		if err != nil {
+			return fmt.Errorf("invalid node ID %s: %w", nodeID, err)
+		}
+
+		variant, err := ua.NewVariant(value)
+		if err != nil {
+			return fmt.Errorf("failed to create variant for %s: %w", nodeID, err)
+		}
+
+		nodesToWrite = append(nodesToWrite, &ua.WriteValue{
+			NodeID:      id,
+			AttributeID: ua.AttributeIDValue,
+			Value: &ua.DataValue{
+				Value: variant,
+			},
+		})
+	}
+
+	req := &ua.WriteRequest{
+		NodesToWrite: nodesToWrite,
+	}
+
+	resp, err := c.client.Write(ctx, req)
+	if err != nil {
+		return fmt.Errorf("write failed: %w", err)
+	}
+
+	for _, result := range resp.Results {
+		if result != ua.StatusOK {
+			return fmt.Errorf("write rejected for one or more nodes: %s", result)
+		}
+	}
+
+	return nil
+}
+
+// ConvertWriteValue 将字符串值按目标类型转换为OPC UA支持的Go类型
+// valueType 可选：int32 / int64 / float32 / float64 / bool / string
+// valueType 为空时自动推断：bool → float64 → string
+func ConvertWriteValue(raw string, valueType string) (any, error) {
+	switch strings.ToLower(valueType) {
+	case "bool":
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to bool: %w", raw, err)
+		}
+		return b, nil
+	case "int32":
+		v, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to int32: %w", raw, err)
+		}
+		return int32(v), nil
+	case "int64":
+		v, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to int64: %w", raw, err)
+		}
+		return v, nil
+	case "float32":
+		v, err := strconv.ParseFloat(raw, 32)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to float32: %w", raw, err)
+		}
+		return float32(v), nil
+	case "float64":
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to float64: %w", raw, err)
+		}
+		return v, nil
+	case "string":
+		return raw, nil
+	default:
+		return autoConvert(raw)
+	}
+}
+
+// autoConvert 自动推断字符串值的类型：bool → float64 → string
+func autoConvert(raw string) (any, error) {
+	if raw == "" {
+		return raw, nil
+	}
+
+	if b, err := strconv.ParseBool(raw); err == nil {
+		return b, nil
+	}
+
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		return f, nil
+	}
+
+	return raw, nil
 }

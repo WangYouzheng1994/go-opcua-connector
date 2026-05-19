@@ -26,8 +26,8 @@ type Collector struct {
 	config *config.CollectorConfig
 	// opcuaClient OPC UA客户端
 	opcuaClient *opcua.Client
-	// publisher NATS发布者
-	publisher *nats.Publisher
+	// natsClient NATS客户端
+	natsClient *nats.Client
 	// logger 日志记录器
 	logger *zap.Logger
 
@@ -42,7 +42,7 @@ type Collector struct {
 	// cancel 取消函数
 	cancel context.CancelFunc
 
-	// nodeStates 节点数据状态表，key为NodeID
+	// nodeStates 节点数据状态表，key为NodeID, value为NodeDataState对象的指针
 	nodeStates map[string]*model.NodeDataState
 	// nodeStatesMu 保护nodeStates的读写锁
 	nodeStatesMu sync.RWMutex
@@ -65,7 +65,7 @@ type Collector struct {
 func New(
 	cfg *config.CollectorConfig,
 	opcuaClient *opcua.Client,
-	publisher *nats.Publisher,
+	natsClient *nats.Client,
 	logger *zap.Logger,
 ) *Collector {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -73,10 +73,10 @@ func New(
 	return &Collector{
 		config:      cfg,
 		opcuaClient: opcuaClient,
-		publisher:   publisher,
+		natsClient:  natsClient,
 		logger:      logger,
-		subCh:      make(chan []model.DataPoint, cfg.ChannelBufferSize),
-		pubCh:      make(chan model.DataPoint, cfg.ChannelBufferSize),
+		subCh:       make(chan []model.DataPoint, cfg.ChannelBufferSize),
+		pubCh:       make(chan model.DataPoint, cfg.ChannelBufferSize),
 		ctx:         ctx,
 		cancel:      cancel,
 		nodeStates:  make(map[string]*model.NodeDataState),
@@ -103,6 +103,7 @@ func (c *Collector) Start() error {
 		zap.Int("resolved_count", len(resolvedNodes)))
 
 	c.nodeStatesMu.Lock()
+	// 遍历读取到的点位信息，按照点位id 和 点位对象(nodeId, 上次更新时间前推1小时，为了让项目启动后立刻触发心跳)进行保存
 	for _, nodeID := range resolvedNodes {
 		c.nodeStates[nodeID] = &model.NodeDataState{
 			NodeID:     nodeID,
@@ -111,6 +112,7 @@ func (c *Collector) Start() error {
 	}
 	c.nodeStatesMu.Unlock()
 
+	// 根据配置的并发量，启动数据处理
 	for i := 0; i < c.config.WorkerCount; i++ {
 		c.wg.Add(1)
 		go c.subWorker(i)
@@ -188,6 +190,7 @@ func (c *Collector) heartbeatWorker() {
 
 	for {
 		select {
+		// 轮循定时
 		case <-ticker.C:
 			c.performHeartbeat()
 
@@ -379,7 +382,7 @@ func (c *Collector) processBatch(batch []model.DataPoint) {
 		topic = "opcua/data"
 	}
 
-	err := c.publisher.PublishBatch(ctx, topic, batch)
+	err := c.natsClient.PublishBatch(ctx, topic, batch)
 
 	latency := time.Since(start).Milliseconds()
 
@@ -420,11 +423,11 @@ func (c *Collector) monitorStats() {
 			total := c.totalPoints.Load()
 
 			stats := &model.CollectorStats{
-				TotalPoints:      total,
-				SuccessCount:     success,
-				FailureCount:     fail,
-				StaleCount:       stale,
-				AvgLatencyMs:     0,
+				TotalPoints:  total,
+				SuccessCount: success,
+				FailureCount: fail,
+				StaleCount:   stale,
+				AvgLatencyMs: 0,
 			}
 
 			if success > 0 {
@@ -462,6 +465,7 @@ func (c *Collector) GetStats() *model.CollectorStats {
 // Stop 停止采集器
 func (c *Collector) Stop() {
 	c.logger.Info("Stopping collector...")
+	// 通过context通知停止，这里会调用c.ctx.Done()
 	c.cancel()
 
 	close(c.subCh)

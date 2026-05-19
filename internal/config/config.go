@@ -61,6 +61,14 @@ type CollectorConfig struct {
 	HeartbeatIntervalSec int `mapstructure:"heartbeat_interval_sec"`
 }
 
+// WritebackConfig 回写配置
+type WritebackConfig struct {
+	// WriteSubject 接收回写命令的NATS主题，默认 opcua/write
+	WriteSubject string `mapstructure:"write_subject"`
+	// ResultSubject 发布回写结果的NATS主题，默认 opcua/write/result
+	ResultSubject string `mapstructure:"result_subject"`
+}
+
 // AppConfig 应用配置
 type AppConfig struct {
 	// AppName 应用名称，默认 go-opcua-connector
@@ -73,6 +81,8 @@ type AppConfig struct {
 	NATS NATSConfig `mapstructure:"nats"`
 	// Collector 采集器配置
 	Collector CollectorConfig `mapstructure:"collector"`
+	// Writeback 回写配置
+	Writeback WritebackConfig `mapstructure:"writeback"`
 }
 
 // Validate 验证应用配置的必填项，为缺失的数值型配置设置默认值
@@ -97,6 +107,12 @@ func (c *AppConfig) Validate() error {
 	}
 	if c.Collector.HeartbeatIntervalSec <= 0 {
 		c.Collector.HeartbeatIntervalSec = 5
+	}
+	if c.Writeback.WriteSubject == "" {
+		c.Writeback.WriteSubject = "opcua/write"
+	}
+	if c.Writeback.ResultSubject == "" {
+		c.Writeback.ResultSubject = "opcua/write/result"
 	}
 	return nil
 }

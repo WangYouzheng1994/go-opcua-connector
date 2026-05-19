@@ -41,6 +41,33 @@ type NodeDataState struct {
 	LastUpdate time.Time
 }
 
+// WriteCommand NATS回写命令，由外部系统通过NATS发送
+type WriteCommand struct {
+	// NodeID 目标OPC UA节点ID
+	NodeID string `json:"node_id"`
+	// Value 待写入的原始值，通常为字符串形式，回写时会进行类型转换
+	Value string `json:"value"`
+	// ValueType 期望的目标类型，可选 int32/int64/float32/float64/bool/string
+	// 为空时自动推断：先尝试数值，再尝试布尔，最后作为字符串
+	ValueType string `json:"value_type,omitempty"`
+	// RequestID 请求标识，用于结果关联
+	RequestID string `json:"request_id,omitempty"`
+}
+
+// WriteResult NATS回写结果
+type WriteResult struct {
+	// NodeID 目标节点ID
+	NodeID string `json:"node_id"`
+	// RequestID 对应的请求标识
+	RequestID string `json:"request_id,omitempty"`
+	// Success 是否成功
+	Success bool `json:"success"`
+	// WrittenValue 实际写入的值
+	WrittenValue any `json:"written_value,omitempty"`
+	// Error 错误信息
+	Error string `json:"error,omitempty"`
+}
+
 // CollectorStats 采集统计信息
 type CollectorStats struct {
 	// TotalPoints 累计采集总数

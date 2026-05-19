@@ -29,4 +29,8 @@ collector:
   stale_threshold_sec: 10
   heartbeat_interval_sec: 5
   subscription_nodes:
-    - ns=2;s=t1.d1
+    - ns=2;s=test.d1.*
+
+writeback:
+  write_subject: opcua/write
+  result_subject: opcua/write/result

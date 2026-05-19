@@ -7,12 +7,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"go-opcua-connector/internal/collector"
 	"go-opcua-connector/internal/config"
 	"go-opcua-connector/internal/nats"
 	"go-opcua-connector/internal/opcua"
+	"go-opcua-connector/internal/writeback"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -30,28 +30,42 @@ func main() {
 		logger.Fatal("Failed to load config", zap.Error(err))
 	}
 
+	// 初始化通知器
 	ctx, cancel := context.WithCancel(context.Background())
+	// 会触发ctx.Done()信号，通知持有ctx的释放资源
 	defer cancel()
 
+	// 创建新的OPC UA客户端
 	opcuaClient := opcua.NewClient(&cfg.OPCUA, logger)
 
+	// opcua 连接
 	if err := opcuaClient.Connect(ctx); err != nil {
 		logger.Fatal("Failed to connect to OPC UA", zap.Error(err))
 	}
 	defer opcuaClient.Close()
 
-	publisher := nats.NewPublisher(&cfg.NATS, logger)
-	if err := publisher.Connect(ctx); err != nil {
+	// natsio 连接
+	natsClient := nats.NewClient(&cfg.NATS, logger)
+	if err := natsClient.Connect(ctx); err != nil {
 		logger.Warn("Failed to connect to NATS, continuing without NATS", zap.Error(err))
 	} else {
-		defer publisher.Close()
+		defer natsClient.Close()
 	}
 
-	col := collector.New(&cfg.Collector, opcuaClient, publisher, logger)
+	col := collector.New(&cfg.Collector, opcuaClient, natsClient, logger)
+	// 采集上送入口
 	if err := col.Start(); err != nil {
 		logger.Fatal("Failed to start collector", zap.Error(err))
 	}
 	defer col.Stop()
+
+	// 初始化回写处理器
+	writebackHandler := writeback.NewHandler(opcuaClient, natsClient, &cfg.Writeback, logger)
+	if err := writebackHandler.Start(ctx); err != nil {
+		logger.Warn("Failed to start writeback handler, writeback disabled", zap.Error(err))
+	} else {
+		defer writebackHandler.Stop()
+	}
 
 	logger.Info("go-opcua-connector started successfully",
 		zap.String("app_name", cfg.AppName),
@@ -61,16 +75,9 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	// 等待信号（阻塞）
 	<-sigCh
-	logger.Info("Received shutdown signal")
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
-	select {
-	case <-shutdownCtx.Done():
-		logger.Warn("Shutdown timeout, forcing exit")
-	}
+	logger.Info("Received shutdown signal, stopping...")
 }
 
 func initLogger() *zap.Logger {
