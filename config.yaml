@@ -9,8 +9,7 @@ opcua:
   password: ""
   security_policy: None
   security_mode: None
-  connect_timeout: 30
-  request_timeout: 30
+  request_timeout: 200
 
 nats:
   urls: nats://192.168.0.69:4222
@@ -26,10 +25,14 @@ collector:
   publish_timeout_ms: 5000
   subscription_topic: opcua/data
   monitor_interval_sec: 60
-  stale_threshold_sec: 10
+  stale_threshold_sec: 30
   heartbeat_interval_sec: 5
+  push_mode: timed
+  push_interval_sec: 1
+  force_heartbeat: true
   subscription_nodes:
     - ns=2;s=test.d1.*
+    - ns=2;s=test.t2.*
 
 writeback:
   write_subject: opcua/write

@@ -4,6 +4,7 @@ package opcua
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"go-opcua-connector/internal/model"
 
 	"github.com/gopcua/opcua"
+	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
 	"go.uber.org/zap"
 )
@@ -63,6 +65,9 @@ func (c *Client) Connect(ctx context.Context) error {
 	opts := []opcua.Option{
 		opcua.SecurityPolicy(c.config.SecurityPolicy),
 		opcua.SecurityMode(c.parseSecurityMode()),
+		opcua.RequestTimeout(time.Duration(c.config.RequestTimeout) * time.Second),
+		opcua.SessionTimeout(1 * time.Hour),
+		opcua.Lifetime(2 * time.Hour),
 	}
 
 	if c.config.Username != "" && c.config.Password != "" {
@@ -86,21 +91,14 @@ func (c *Client) Connect(ctx context.Context) error {
 	return nil
 }
 
-// Subscribe 创建订阅并注册监控项
+// Subscribe 创建订阅并注册监控项。
+// 节点数>5000时自动拆分为多个Subscription分摊KepServer内部负载。
 func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, handler DataChangeHandler) error {
 	if c.client == nil {
 		return fmt.Errorf("client not connected, call Connect() first")
 	}
 
-	notificationCh := make(chan *opcua.PublishNotificationData, 100)
-
-	sub, err := c.client.Subscribe(ctx, &opcua.SubscriptionParameters{
-		Interval: 100,
-	}, notificationCh)
-	if err != nil {
-		return fmt.Errorf("failed to create subscription: %w", err)
-	}
-
+	// 预先构建所有MonitoredItem，ClientHandle 为全局节点索引
 	monitorItems := make([]*ua.MonitoredItemCreateRequest, len(nodes))
 	for i, node := range nodes {
 		nodeID, err := ua.ParseNodeID(node)
@@ -110,16 +108,83 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 		monitorItems[i] = opcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, uint32(i))
 	}
 
-	go c.handleNotifications(sub, notificationCh, topic, handler, nodes)
+	// 每个 Subscription 最多挂载 2000 个 MonitoredItem，
+	// 一次 Monitor 搞定，不内层分批。
+	const itemsPerSub = 2000
+	subCount := (len(monitorItems) + itemsPerSub - 1) / itemsPerSub
+	batchTimeout := time.Duration(c.config.RequestTimeout) * time.Second
 
-	_, err = sub.Monitor(ctx, ua.TimestampsToReturnBoth, monitorItems...)
-	if err != nil {
-		return fmt.Errorf("failed to create monitored items: %w", err)
+	// mergedCh 汇总所有 Subscription 的通知，统一由 handleNotifications 消费
+	mergedCh := make(chan *opcua.PublishNotificationData, 1000)
+
+	c.logger.Info("Registering monitored items with multiple subscriptions",
+		zap.Int("total_items", len(monitorItems)),
+		zap.Int("items_per_sub", itemsPerSub),
+		zap.Int("sub_count", subCount),
+		zap.Duration("timeout_per_batch", batchTimeout))
+
+	for subIdx := 0; subIdx < subCount; subIdx++ {
+		subStart := subIdx * itemsPerSub
+		subEnd := subStart + itemsPerSub
+		if subEnd > len(monitorItems) {
+			subEnd = len(monitorItems)
+		}
+		itemsInSub := monitorItems[subStart:subEnd]
+
+		subCh := make(chan *opcua.PublishNotificationData, 100)
+		sub, err := c.client.Subscribe(ctx, &opcua.SubscriptionParameters{
+			Interval: 100,
+		}, subCh)
+		if err != nil {
+			return fmt.Errorf("failed to create subscription %d/%d: %w", subIdx+1, subCount, err)
+		}
+
+		// 将该 Subscription 的通知转到汇总通道
+		go func(ch chan *opcua.PublishNotificationData) {
+			for n := range ch {
+				mergedCh <- n
+			}
+		}(subCh)
+
+		c.logger.Info("Creating monitored items for subscription",
+			zap.Int("sub", subIdx+1),
+			zap.Int("sub_count", subCount),
+			zap.Int("items", len(itemsInSub)))
+
+		batchCtx, batchCancel := context.WithTimeout(ctx, batchTimeout)
+		start := time.Now()
+		_, err = sub.Monitor(batchCtx, ua.TimestampsToReturnBoth, itemsInSub...)
+		elapsed := time.Since(start)
+		batchCancel()
+
+		if err != nil {
+			c.logger.Error("Failed to create monitored items for subscription",
+				zap.Int("sub", subIdx+1),
+				zap.Int("sub_count", subCount),
+				zap.Int("items", len(itemsInSub)),
+				zap.Duration("elapsed", elapsed),
+				zap.Error(err))
+			return fmt.Errorf("failed to create monitored items (sub %d/%d): %w", subIdx+1, subCount, err)
+		}
+
+		c.logger.Info("Monitored items created",
+			zap.Int("sub", subIdx+1),
+			zap.Int("sub_count", subCount),
+			zap.Int("items", len(itemsInSub)),
+			zap.Duration("elapsed", elapsed))
+
+		c.logger.Info("Subscription registered",
+			zap.Int("sub", subIdx+1),
+			zap.Int("sub_count", subCount),
+			zap.Int("items", len(itemsInSub)),
+			zap.Uint32("subscription_id", sub.SubscriptionID))
 	}
 
-	c.logger.Info("Subscription created",
+	go c.handleNotifications(mergedCh, topic, handler, nodes)
+
+	c.logger.Info("All subscriptions created",
 		zap.Int("node_count", len(nodes)),
-		zap.Uint32("subscription_id", sub.SubscriptionID))
+		zap.Int("sub_count", subCount))
 
 	return nil
 }
@@ -127,7 +192,6 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 // handleNotifications 处理OPC UA订阅通知数据
 // 解析DataChangeNotification，通过ClientHandle映射回NodeID
 func (c *Client) handleNotifications(
-	sub *opcua.Subscription,
 	notificationCh chan *opcua.PublishNotificationData,
 	topic string,
 	handler DataChangeHandler,
@@ -200,6 +264,20 @@ func (c *Client) Close() {
 	}
 
 	c.logger.Info("OPC UA client closed")
+}
+
+// Reconnect 关闭旧连接后重新连接 OPC UA 服务器
+// 用于长时间运行中会话过期后的恢复
+func (c *Client) Reconnect(ctx context.Context) error {
+	c.mu.Lock()
+	if c.client != nil {
+		c.client.Close(context.Background())
+		c.client = nil
+	}
+	c.mu.Unlock()
+
+	c.logger.Info("Reconnecting to OPC UA server")
+	return c.Connect(ctx)
 }
 
 // parseSecurityMode 解析安全模式配置
@@ -280,17 +358,20 @@ func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, 
 	return resolved, nil
 }
 
-// browseVariableLeaves 浏览节点的直接Variable子节点，仅取当前层级
+// browseVariableLeaves 浏览节点的直接Variable子节点，仅取当前层级，仅 HasComponent 引用类型（排除 HasProperty 的元数据属性节点）
 func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
 	node := c.client.Node(nodeID)
 
-	refs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
+	refs, err := node.References(ctx, id.HasComponent, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
 	if err != nil {
 		return nil, err
 	}
 
 	leaves := make([]string, 0, len(refs))
 	for _, ref := range refs {
+		if strings.HasPrefix(ref.BrowseName.Name, "_") {
+			continue
+		}
 		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
 		if childNode == nil || childNode.ID == nil {
 			continue
@@ -306,14 +387,18 @@ func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([
 func (c *Client) browseAllLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
 	node := c.client.Node(nodeID)
 
-	// 收集当前层级的Variable子节点
-	varRefs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
+	// 收集当前层级的Variable子节点，仅 HasComponent 引用类型（排除 HasProperty 的元数据属性节点）
+	varRefs, err := node.References(ctx, id.HasComponent, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
 	if err != nil {
 		return nil, err
 	}
 
 	leaves := make([]string, 0)
 	for _, ref := range varRefs {
+		// 额外兜底：过滤 _ 开头的 BrowseName（部分非标准 Server 可能不用 HasProperty）
+		if strings.HasPrefix(ref.BrowseName.Name, "_") {
+			continue
+		}
 		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
 		if childNode == nil || childNode.ID == nil {
 			continue
@@ -322,7 +407,7 @@ func (c *Client) browseAllLeaves(ctx context.Context, nodeID *ua.NodeID) ([]stri
 	}
 
 	// 递归进入Object子文件夹，跳过_开头的KepServer元数据节点
-	objRefs, err := node.References(ctx, 0, ua.BrowseDirectionForward, ua.NodeClassObject, true)
+	objRefs, err := node.References(ctx, id.Organizes, ua.BrowseDirectionForward, ua.NodeClassObject, true)
 	if err != nil {
 		return leaves, nil
 	}
@@ -478,13 +563,20 @@ func (c *Client) Write(ctx context.Context, nodeID string, value any) error {
 		return fmt.Errorf("failed to create variant: %w", err)
 	}
 
+	c.logger.Info("Write variant created",
+		zap.String("node_id", nodeID),
+		zap.Any("value", value),
+		zap.Any("variant_type", variant.Type()),
+		zap.Any("variant_type_int", int(variant.Type())))
+
 	req := &ua.WriteRequest{
 		NodesToWrite: []*ua.WriteValue{
 			{
 				NodeID:      id,
 				AttributeID: ua.AttributeIDValue,
 				Value: &ua.DataValue{
-					Value: variant,
+					EncodingMask: ua.DataValueValue,
+					Value:        variant,
 				},
 			},
 		},
@@ -550,41 +642,299 @@ func (c *Client) WriteAll(ctx context.Context, items map[string]any) error {
 	return nil
 }
 
-// ConvertWriteValue 将字符串值按目标类型转换为OPC UA支持的Go类型
-// valueType 可选：int32 / int64 / float32 / float64 / bool / string
-// valueType 为空时自动推断：bool → float64 → string
+// ReadNodeDataTypes 批量读取节点的 DataType 属性，用于回写时自动类型适配
+func (c *Client) ReadNodeDataTypes(ctx context.Context, nodeIDs []string) (map[string]string, error) {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+
+	if cli == nil {
+		return nil, fmt.Errorf("client not connected")
+	}
+
+	if len(nodeIDs) == 0 {
+		return nil, nil
+	}
+
+	nodesToRead := make([]*ua.ReadValueID, 0, len(nodeIDs))
+	nodeIDList := make([]string, 0, len(nodeIDs))
+
+	for _, nodeID := range nodeIDs {
+		id, err := ua.ParseNodeID(nodeID)
+		if err != nil {
+			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", nodeID), zap.Error(err))
+			continue
+		}
+		nodesToRead = append(nodesToRead, &ua.ReadValueID{
+			NodeID:       id,
+			AttributeID:  ua.AttributeIDDataType,
+			IndexRange:   "",
+			DataEncoding: nil,
+		})
+		nodeIDList = append(nodeIDList, nodeID)
+	}
+
+	if len(nodesToRead) == 0 {
+		return map[string]string{}, nil
+	}
+
+	req := &ua.ReadRequest{
+		NodesToRead:        nodesToRead,
+		TimestampsToReturn: ua.TimestampsToReturnNeither,
+	}
+
+	resp, err := cli.Read(ctx, req)
+	if err != nil {
+		return nil, fmt.Errorf("read data types failed: %w", err)
+	}
+
+	result := make(map[string]string, len(nodeIDList))
+	for i, nodeResult := range resp.Results {
+		if i >= len(nodeIDList) {
+			break
+		}
+		nodeID := nodeIDList[i]
+		if nodeResult.Status != ua.StatusOK {
+			c.logger.Warn("Failed to read data type for node",
+				zap.String("node_id", nodeID),
+				zap.String("status", fmt.Sprintf("%s", nodeResult.Status)))
+			// 仅当结果中不存在时才设置默认值，防止覆盖有效数据
+			if _, exists := result[nodeID]; !exists {
+				result[nodeID] = "String"
+			}
+			continue
+		}
+
+		if nodeResult.Value != nil && nodeResult.Value.NodeID() != nil {
+			result[nodeID] = typeIDToString(nodeResult.Value.NodeID())
+		} else {
+			result[nodeID] = "String"
+		}
+	}
+
+	return result, nil
+}
+
+// typeIDToString 将 OPC UA TypeID 转换为可读字符串
+func typeIDToString(typeID *ua.NodeID) string {
+	if typeID == nil {
+		return "String"
+	}
+
+	switch typeID.IntID() {
+	case 0:
+		return "Null"
+	case 1:
+		return "Boolean"
+	case 2:
+		return "SByte"
+	case 3:
+		return "Byte"
+	case 4:
+		return "Int16"
+	case 5:
+		return "UInt16"
+	case 6:
+		return "Int32"
+	case 7:
+		return "UInt32"
+	case 8:
+		return "Int64"
+	case 9:
+		return "UInt64"
+	case 10:
+		return "Float"
+	case 11:
+		return "Double"
+	case 12:
+		return "String"
+	case 13:
+		return "DateTime"
+	case 14:
+		return "GUID"
+	case 15:
+		return "ByteString"
+	case 16:
+		return "XML"
+	case 17:
+		return "NodeID"
+	case 18:
+		return "StatusCode"
+	case 19:
+		return "QualifiedName"
+	case 20:
+		return "LocalizedText"
+	case 21:
+		return "ExtensionObject"
+	case 22:
+		return "DataValue"
+	case 23:
+		return "Variant"
+	case 24:
+		return "DiagnosticInfo"
+	default:
+		return fmt.Sprintf("NodeID:%s", typeID.String())
+	}
+}
+
+// coerceToInt 将字符串强制转换为有符号整数。
+// 三级回退策略：
+//   1. 数值解析：直接 ParseInt
+//   2. bool 映射： "true"/"1"→1, "false"/"0"→0
+//   3. 浮点截断：ParseFloat 后转换为整数，越界时报错
+func coerceToInt(raw string, bitSize int) (int64, error) {
+	v, err := strconv.ParseInt(raw, 10, bitSize)
+	if err == nil {
+		return v, nil
+	}
+	// 一级回退：解析为布尔值后映射到 1/0
+	if b, ok := parseBoolish(raw); ok {
+		if b {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	// 二级回退：解析为浮点数后截断为整数
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		if f > math.MaxInt64 || f < math.MinInt64 {
+			return 0, fmt.Errorf("float %v out of int64 range", f)
+		}
+		return int64(f), nil
+	}
+	return 0, fmt.Errorf("cannot coerce %q to int", raw)
+}
+
+// coerceToUint 将字符串强制转换为无符号整数。
+// 三级回退策略同 coerceToInt，但浮点数负值会被拒绝。
+func coerceToUint(raw string, bitSize int) (uint64, error) {
+	v, err := strconv.ParseUint(raw, 10, bitSize)
+	if err == nil {
+		return v, nil
+	}
+	// 一级回退：布尔值映射到 1/0
+	if b, ok := parseBoolish(raw); ok {
+		if b {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	// 二级回退：浮点数截断，负值和非数字会被拒绝
+	if f, err := strconv.ParseFloat(raw, 64); err == nil {
+		if f < 0 || f > math.MaxUint64 {
+			return 0, fmt.Errorf("float %v out of uint64 range", f)
+		}
+		return uint64(f), nil
+	}
+	return 0, fmt.Errorf("cannot coerce %q to uint", raw)
+}
+
+// parseBoolish 尝试解析类布尔值，strconv.ParseBool 已覆盖 "1"/"0"/"true"/"false"/"t"/"f" 等。
+// 返回值和是否成功。
+func parseBoolish(raw string) (bool, bool) {
+	b, err := strconv.ParseBool(raw)
+	return b, err == nil
+}
+
+// ConvertWriteValue 将字符串值按目标类型转换为OPC UA支持的Go类型。
+// 三层强转策略，按优先级依次尝试：
+//   - 数值目标：数值解析 → bool(1/0) → 浮点截断
+//   - 布尔目标：ParseBool → "1"/"0" → 浮点非零判断
+//   - 浮点目标：ParseFloat → bool(1.0/0.0)
+//
+// valueType 可选：bool / boolean / sbyte / byte / int16 / uint16 / int32 / uint32 / int64 / uint64 / float / float32 / double / float64 / string
+// valueType 为空或未知时走 autoConvert 自动推断：bool → float64 → string
 func ConvertWriteValue(raw string, valueType string) (any, error) {
 	switch strings.ToLower(valueType) {
-	case "bool":
-		b, err := strconv.ParseBool(raw)
-		if err != nil {
-			return nil, fmt.Errorf("cannot convert %q to bool: %w", raw, err)
+	case "boolean", "bool":
+		// bool 三级强转：标准 ParseBool → 数字 "1"/"0" → 浮点非零为 true
+		if b, err := strconv.ParseBool(raw); err == nil {
+			return b, nil
 		}
-		return b, nil
+		if raw == "1" {
+			return true, nil
+		}
+		if raw == "0" {
+			return false, nil
+		}
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f != 0, nil
+		}
+		return nil, fmt.Errorf("cannot convert %q to bool", raw)
+	case "sbyte":
+		// coerceToInt 内置三级回退：数值解析 → bool(1/0) → 浮点截断
+		v, err := coerceToInt(raw, 8)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to sbyte: %w", raw, err)
+		}
+		return int8(v), nil
+	case "byte":
+		v, err := coerceToUint(raw, 8)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to byte: %w", raw, err)
+		}
+		return uint8(v), nil
+	case "int16":
+		v, err := coerceToInt(raw, 16)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to int16: %w", raw, err)
+		}
+		return int16(v), nil
+	case "uint16":
+		v, err := coerceToUint(raw, 16)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to uint16: %w", raw, err)
+		}
+		return uint16(v), nil
 	case "int32":
-		v, err := strconv.ParseInt(raw, 10, 32)
+		v, err := coerceToInt(raw, 32)
 		if err != nil {
 			return nil, fmt.Errorf("cannot convert %q to int32: %w", raw, err)
 		}
 		return int32(v), nil
+	case "uint32":
+		v, err := coerceToUint(raw, 32)
+		if err != nil {
+			return nil, fmt.Errorf("cannot convert %q to uint32: %w", raw, err)
+		}
+		return uint32(v), nil
 	case "int64":
-		v, err := strconv.ParseInt(raw, 10, 64)
+		v, err := coerceToInt(raw, 64)
 		if err != nil {
 			return nil, fmt.Errorf("cannot convert %q to int64: %w", raw, err)
 		}
 		return v, nil
-	case "float32":
-		v, err := strconv.ParseFloat(raw, 32)
+	case "uint64":
+		v, err := coerceToUint(raw, 64)
 		if err != nil {
-			return nil, fmt.Errorf("cannot convert %q to float32: %w", raw, err)
-		}
-		return float32(v), nil
-	case "float64":
-		v, err := strconv.ParseFloat(raw, 64)
-		if err != nil {
-			return nil, fmt.Errorf("cannot convert %q to float64: %w", raw, err)
+			return nil, fmt.Errorf("cannot convert %q to uint64: %w", raw, err)
 		}
 		return v, nil
+	case "float", "float32":
+		// float32 二级强转：数值解析 → bool(1.0/0.0)
+		v, err := strconv.ParseFloat(raw, 32)
+		if err == nil {
+			return float32(v), nil
+		}
+		if b, ok := parseBoolish(raw); ok {
+			if b {
+				return float32(1), nil
+			}
+			return float32(0), nil
+		}
+		return nil, fmt.Errorf("cannot convert %q to float32", raw)
+	case "double", "float64":
+		// float64 二级强转：数值解析 → bool(1.0/0.0)
+		v, err := strconv.ParseFloat(raw, 64)
+		if err == nil {
+			return v, nil
+		}
+		if b, ok := parseBoolish(raw); ok {
+			if b {
+				return float64(1), nil
+			}
+			return float64(0), nil
+		}
+		return nil, fmt.Errorf("cannot convert %q to float64", raw)
 	case "string":
 		return raw, nil
 	default:

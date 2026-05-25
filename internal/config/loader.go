@@ -39,7 +39,6 @@ func (l *Loader) Load() (*AppConfig, error) {
 
 	v.SetDefault("app_name", "go-opcua-connector")
 	v.SetDefault("log_level", "info")
-	v.SetDefault("opcua.connect_timeout", 30)
 	v.SetDefault("opcua.request_timeout", 30)
 	v.SetDefault("nats.max_reconnects", -1)
 	v.SetDefault("nats.reconnect_wait_ms", 1000)

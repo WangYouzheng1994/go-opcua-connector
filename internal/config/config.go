@@ -19,8 +19,6 @@ type OPCUAConfig struct {
 	SecurityPolicy string `mapstructure:"security_policy"`
 	// SecurityMode 安全模式，可选值 None、Sign、SignAndEncrypt
 	SecurityMode string `mapstructure:"security_mode"`
-	// ConnectTimeout 连接超时时间，单位秒，默认30
-	ConnectTimeout int `mapstructure:"connect_timeout"`
 	// RequestTimeout 请求超时时间，单位秒，默认30
 	RequestTimeout int `mapstructure:"request_timeout"`
 }
@@ -39,6 +37,16 @@ type NATSConfig struct {
 	ReconnectWaitMs int `mapstructure:"reconnect_wait_ms"`
 }
 
+// PushModeType 推送模式类型
+type PushModeType string
+
+const (
+	// PushModeImmediate 即时推送：每次变化立即推送，同时支持心跳强制推送
+	PushModeImmediate PushModeType = "immediate"
+	// PushModeTimed 定时推送：累积变化，定时批量推送全量快照
+	PushModeTimed PushModeType = "timed"
+)
+
 // CollectorConfig 采集器配置
 type CollectorConfig struct {
 	// WorkerCount 并发worker数量，默认10
@@ -55,10 +63,16 @@ type CollectorConfig struct {
 	SubscriptionTopic string `mapstructure:"subscription_topic"`
 	// MonitorIntervalSec 监控统计输出间隔，单位秒，默认60
 	MonitorIntervalSec int `mapstructure:"monitor_interval_sec"`
-	// StaleThresholdSec 数据停滞判定阈值，单位秒，默认10
+	// StaleThresholdSec 数据停滞判定阈值，单位秒，默认30
 	StaleThresholdSec int `mapstructure:"stale_threshold_sec"`
 	// HeartbeatIntervalSec 心跳验证拉取间隔，单位秒，默认5
 	HeartbeatIntervalSec int `mapstructure:"heartbeat_interval_sec"`
+	// PushMode 推送模式：immediate（即时推送）或 timed（定时批量推送），默认 timed
+	PushMode PushModeType `mapstructure:"push_mode"`
+	// PushIntervalSec 定时模式下的推送间隔，单位秒，默认1
+	PushIntervalSec int `mapstructure:"push_interval_sec"`
+	// ForceHeartbeat 即时模式下是否强制心跳推送，默认true
+	ForceHeartbeat bool `mapstructure:"force_heartbeat"`
 }
 
 // WritebackConfig 回写配置
@@ -107,6 +121,12 @@ func (c *AppConfig) Validate() error {
 	}
 	if c.Collector.HeartbeatIntervalSec <= 0 {
 		c.Collector.HeartbeatIntervalSec = 5
+	}
+	if c.Collector.PushMode == "" {
+		c.Collector.PushMode = PushModeTimed
+	}
+	if c.Collector.PushIntervalSec <= 0 {
+		c.Collector.PushIntervalSec = 1
 	}
 	if c.Writeback.WriteSubject == "" {
 		c.Writeback.WriteSubject = "opcua/write"

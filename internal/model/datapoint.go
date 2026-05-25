@@ -25,20 +25,23 @@ type NATSMessage struct {
 	DataPoint DataPoint `json:"data_point"`
 }
 
-// NodeDataState 节点数据状态（用于心跳验证）
+// NodeDataState 节点数据状态（内存池中的统一状态）
 type NodeDataState struct {
 	// NodeID 节点ID
 	NodeID string
-	// SubValue 订阅推送的最新值
-	SubValue any
-	// SubTimestamp 订阅推送的时间戳
-	SubTimestamp time.Time
-	// ReadValue 心跳拉取的最新值
-	ReadValue any
-	// ReadTimestamp 心跳拉取的时间戳
-	ReadTimestamp time.Time
-	// LastUpdate 最后更新时间，用于停滞判定
-	LastUpdate time.Time
+	// Value 当前值
+	Value any
+	// Quality 品质，取值为 Good/Bad/Uncertain/Stale
+	Quality string
+	// Timestamp 最新值的时间戳
+	Timestamp time.Time
+	// Status 节点状态：Online（正常）/ Stale（停滞）/ Error（错误）
+	Status string
+	// DataType OPC UA数据类型：String/Int32/Int64/Float32/Float64/Bool/Double 等
+	// 用于回写时自动类型适配
+	DataType string
+	// Dirty 是否需要推送（仅定时模式使用）
+	Dirty bool
 }
 
 // WriteCommand NATS回写命令，由外部系统通过NATS发送
@@ -78,6 +81,8 @@ type CollectorStats struct {
 	FailureCount int64 `json:"failure_count"`
 	// StaleCount 停滞数据点数
 	StaleCount int64 `json:"stale_count"`
+	// DroppedPoints 丢弃的数据点数
+	DroppedPoints int64 `json:"dropped_points"`
 	// LastSuccessTime 最后成功时间
 	LastSuccessTime time.Time `json:"last_success_time"`
 	// LastFailureTime 最后失败时间
