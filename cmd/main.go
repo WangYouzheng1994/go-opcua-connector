@@ -4,6 +4,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -24,6 +26,14 @@ func main() {
 	defer logger.Sync()
 
 	logger.Info("Starting go-opcua-connector...")
+
+	go func() {
+		pprofAddr := ":6060"
+		logger.Info("pprof endpoint listening", zap.String("addr", pprofAddr))
+		if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+			logger.Warn("pprof server stopped", zap.Error(err))
+		}
+	}()
 
 	cfg, err := loadConfig()
 	if err != nil {

@@ -349,18 +349,32 @@ t1.d1 下所有层级、所有文件夹的叶子变量
 
 ### 数据发布
 
+定时模式（`push_mode: timed`）每个周期推送全量快照，即时模式（`push_mode: immediate`）每次变化推单条，两种模式都使用 `PublishBatch` 统一通道，格式为批量包装：
+
 ```json
 {
   "topic": "opcua/data",
-  "data_point": {
-    "node_id": "ns=2;s=t1.d1.t495",
-    "value": 42.5,
-    "quality": "Good",
-    "timestamp": "2026-05-12T10:00:00Z",
-    "topic": "opcua/data"
-  }
+  "points": [
+    {
+      "node_id": "ns=2;s=t1.d1.t495",
+      "value": 42.5,
+      "quality": "Good",
+      "timestamp": "2026-05-12T10:00:00Z",
+      "topic": "opcua/data"
+    }
+  ]
 }
 ```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `topic` | string | 外层 NATS 主题，受 `subscription_topic` 控制 |
+| `points` | array | DataPoint 数组，定时模式包含全量节点，即时模式包含单个变化节点 |
+| `points[].node_id` | string | OPC UA 节点标识符 |
+| `points[].value` | any | 节点当前值 |
+| `points[].quality` | string | 品质：`Good` / `Bad` / `Uncertain` / `Stale` |
+| `points[].timestamp` | string | ISO 8601 时间戳 |
+| `points[].topic` | string | 内层数据来源主题，与外层 `topic` 相同 |
 
 ### 回写命令
 
@@ -459,6 +473,56 @@ go mod tidy
 # 跨平台编译
 $env:GOOS="linux"; $env:GOARCH="amd64"; go build -o go-opcua-connector ./cmd/
 ```
+
+---
+
+## 性能分析（pprof）
+
+程序内置 pprof 端点，监听 `:6060`，用于排查内存泄漏、goroutine 泄漏等运行时问题。
+
+### 启动后访问
+
+```bash
+# 浏览器概览
+http://localhost:6060/debug/pprof/
+
+# 抓 heap 快照（推荐运行半小时后抓）
+go tool pprof http://localhost:6060/debug/pprof/heap
+
+# 抓 goroutine 快照
+go tool pprof http://localhost:6060/debug/pprof/goroutine
+```
+
+### pprof 交互命令
+
+```
+top30                # 按内存占用排名前 30
+list <funcName>      # 查看某函数逐行分配详情
+web                  # 生成火焰图（需安装 graphviz）
+tree                 # 调用树视图
+```
+
+### 对比两次 heap 找增量泄漏
+
+```bash
+# 第一次抓取（运行一段时间后）
+curl -o heap1.pb.gz http://localhost:6060/debug/pprof/heap
+
+# 等待 10 分钟后第二次抓取
+curl -o heap2.pb.gz http://localhost:6060/debug/pprof/heap
+
+# 对比差异
+go tool pprof -base heap1.pb.gz heap2.pb.gz
+```
+
+### 关注指标
+
+| 指标 | 含义 |
+|------|------|
+| `inuse_space` | 当前实际占用的堆内存 |
+| `alloc_space` | 累计分配总量（含已释放） |
+| `alloc_space` ↑ 但 `inuse_space` 稳定 | GC 慢但不泄漏 |
+| `inuse_space` 持续 ↑ | 真内存泄漏 |
 
 ---
 
