@@ -55,8 +55,8 @@ go-opcua-connector/
 │   │   ├── doc.go              # 数据模型说明
 │   │   └── datapoint.go        # DataPoint、NATSMessage、NodeDataState、CollectorStats
 │   ├── nats/
-│   │   ├── doc.go              # NATS 发布模块说明
-│   │   └── publisher.go        # NATS 发布者：连接管理、单条/批量发布、重连
+│   │   ├── client.go              # NATS 客户端：连接管理、单条/批量发布、订阅
+
 │   ├── opcua/
 │   │   ├── doc.go              # OPC UA 客户端说明
 │   │   └── client.go           # OPC UA 客户端：连接、订阅、读、写、节点展开
@@ -83,7 +83,7 @@ go-opcua-connector/
 | `internal/collector/` | 核心采集引擎：内存池管理、订阅处理、健康检查（即心跳验证+停滞检测）、即时/定时双模式推送 |
 | `internal/config/` | 配置：结构体定义（OPCUAConfig / NATSConfig / CollectorConfig / WritebackConfig）及 Viper 加载器 |
 | `internal/model/` | 数据模型：DataPoint（数据点）、NATSMessage（发布消息）、NodeDataState（节点状态）、CollectorStats（统计信息） |
-| `internal/nats/` | NATS 发布者：连接建立、单条/批量 Publish、自动重连、连接状态回调 |
+| `internal/nats/` | NATS 客户端：连接建立、单条/批量 Publish、自动重连、连接状态回调 |
 | `internal/opcua/` | OPC UA 客户端：Connect（TCP+Session）、Subscribe（创建订阅与监控项）、Read/ReadAll 批量读取、ResolveNodes 节点展开 |
 | `internal/writeback/` | 回写处理器：订阅 NATS 写命令、类型转换、写入 OPC UA、发布结果 |
 | `pkg/pool/` | 公共对象池：泛型 Pool[T]、BytePool 字节缓冲池、SlicePool[T] 切片池 |
@@ -446,7 +446,7 @@ t1.d1 下所有层级、所有文件夹的叶子变量
 | 2 | `internal/model/datapoint.go` | DataPoint、NATSMessage、NodeDataState、CollectorStats |
 | 3 | `internal/config/config.go` | 配置结构体定义 |
 | 4 | `internal/opcua/client.go` | Connect() → Subscribe() → handleNotifications() → ResolveNodes() → ReadAll() |
-| 5 | `internal/nats/publisher.go` | Connect() → Publish() → PublishBatch() |
+| 5 | `internal/nats/client.go` | Connect() → Publish() → PublishBatch() |
 | 6 | `internal/collector/collector.go` | Start() → subWorker() → healthCheckWorker() → publishWorker() |
 | 7 | `internal/writeback/handler.go` | 订阅 NATS 命令 → 类型转换 → 写入 OPC UA |
 
