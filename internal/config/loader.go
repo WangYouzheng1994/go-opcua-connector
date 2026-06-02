@@ -47,6 +47,15 @@ func (l *Loader) Load() (*AppConfig, error) {
 	v.SetDefault("collector.channel_buffer_size", 10000)
 	v.SetDefault("collector.publish_timeout_ms", 5000)
 	v.SetDefault("collector.monitor_interval_sec", 60)
+	v.SetDefault("mqtt.qos", 0)
+	v.SetDefault("mqtt.retained", false)
+	v.SetDefault("mqtt.clean_session", true)
+	v.SetDefault("mqtt.keepalive_sec", 60)
+	v.SetDefault("mqtt.connect_timeout_sec", 10)
+	v.SetDefault("mqtt.publish_timeout_sec", 5)
+	v.SetDefault("mqtt.auto_reconnect", true)
+	v.SetDefault("mqtt.max_reconnect_delay_sec", 60)
+	v.SetDefault("mqtt.insecure_skip_verify", false)
 
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {

@@ -227,7 +227,6 @@ func (c *Client) handleNotifications(
 
 				dp := model.DataPoint{
 					NodeID: nodeID,
-					Topic:  topic,
 				}
 
 				if item.Value != nil {

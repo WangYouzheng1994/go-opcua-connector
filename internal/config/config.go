@@ -3,6 +3,16 @@ package config
 
 import "fmt"
 
+// OutputType 输出目标类型
+type OutputType string
+
+const (
+	// OutputTypeNATS 推送到NATS
+	OutputTypeNATS OutputType = "nats"
+	// OutputTypeMQTT 推送到MQTT
+	OutputTypeMQTT OutputType = "mqtt"
+)
+
 // OPCUAConfig OPC UA服务器配置
 type OPCUAConfig struct {
 	// Endpoint OPC UA服务器端点地址，格式 opc.tcp://host:port
@@ -47,8 +57,31 @@ const (
 	PushModeTimed PushModeType = "timed"
 )
 
+// MQTTConfig MQTT配置，仅 output_type=mqtt 时生效
+type MQTTConfig struct {
+	Brokers              string `mapstructure:"brokers"`
+	ClientID             string `mapstructure:"client_id"`
+	Username             string `mapstructure:"username"`
+	Password             string `mapstructure:"password"`
+	Topic                string `mapstructure:"topic"`
+	Qos                  int    `mapstructure:"qos"`
+	Retained             bool   `mapstructure:"retained"`
+	CleanSession         bool   `mapstructure:"clean_session"`
+	KeepAliveSec         int    `mapstructure:"keepalive_sec"`
+	ConnectTimeoutSec    int    `mapstructure:"connect_timeout_sec"`
+	PublishTimeoutSec    int    `mapstructure:"publish_timeout_sec"`
+	AutoReconnect        bool   `mapstructure:"auto_reconnect"`
+	MaxReconnectDelaySec int    `mapstructure:"max_reconnect_delay_sec"`
+	TLSCertFile          string `mapstructure:"tls_cert_file"`
+	TLSKeyFile           string `mapstructure:"tls_key_file"`
+	TLSCAFile            string `mapstructure:"tls_ca_file"`
+	InsecureSkipVerify   bool   `mapstructure:"insecure_skip_verify"`
+}
+
 // CollectorConfig 采集器配置
 type CollectorConfig struct {
+	// OutputType 输出目标类型：nats / mqtt，默认 nats
+	OutputType OutputType `mapstructure:"output_type"`
 	// WorkerCount 并发worker数量，默认10
 	WorkerCount int `mapstructure:"worker_count"`
 	// BatchSize 每批发布的数据点数量，默认100
@@ -59,7 +92,7 @@ type CollectorConfig struct {
 	PublishTimeoutMs int `mapstructure:"publish_timeout_ms"`
 	// SubscriptionNodes 订阅的OPC UA节点ID列表，支持文件夹级自动展开
 	SubscriptionNodes []string `mapstructure:"subscription_nodes"`
-	// SubscriptionTopic NATS订阅主题，默认 opcua/data
+	// SubscriptionTopic 发布主题，默认 opcua/data
 	SubscriptionTopic string `mapstructure:"subscription_topic"`
 	// MonitorIntervalSec 监控统计输出间隔，单位秒，默认60
 	MonitorIntervalSec int `mapstructure:"monitor_interval_sec"`
@@ -77,9 +110,9 @@ type CollectorConfig struct {
 
 // WritebackConfig 回写配置
 type WritebackConfig struct {
-	// WriteSubject 接收回写命令的NATS主题，默认 opcua/write
+	// WriteSubject 接收回写命令的主题，默认 opcua/write
 	WriteSubject string `mapstructure:"write_subject"`
-	// ResultSubject 发布回写结果的NATS主题，默认 opcua/write/result
+	// ResultSubject 发布回写结果的主题，默认 opcua/write/result
 	ResultSubject string `mapstructure:"result_subject"`
 }
 
@@ -93,6 +126,7 @@ type AppConfig struct {
 	OPCUA OPCUAConfig `mapstructure:"opcua"`
 	// NATS NATS服务器配置
 	NATS NATSConfig `mapstructure:"nats"`
+	MQTT MQTTConfig `mapstructure:"mqtt"`
 	// Collector 采集器配置
 	Collector CollectorConfig `mapstructure:"collector"`
 	// Writeback 回写配置
@@ -104,8 +138,22 @@ func (c *AppConfig) Validate() error {
 	if c.OPCUA.Endpoint == "" {
 		return fmt.Errorf("OPC UA endpoint is required")
 	}
-	if c.NATS.URLs == "" {
-		return fmt.Errorf("NATS URLs is required")
+
+	if c.Collector.OutputType == "" {
+		c.Collector.OutputType = OutputTypeNATS
+	}
+
+	switch c.Collector.OutputType {
+	case OutputTypeNATS:
+		if c.NATS.URLs == "" {
+			return fmt.Errorf("NATS URLs is required when output_type is nats")
+		}
+	case OutputTypeMQTT:
+		if c.MQTT.Brokers == "" {
+			return fmt.Errorf("MQTT brokers is required when output_type is mqtt")
+		}
+	default:
+		return fmt.Errorf("invalid output_type: %s, must be nats / mqtt", c.Collector.OutputType)
 	}
 	if c.Collector.WorkerCount <= 0 {
 		c.Collector.WorkerCount = 10
@@ -133,6 +181,21 @@ func (c *AppConfig) Validate() error {
 	}
 	if c.Writeback.ResultSubject == "" {
 		c.Writeback.ResultSubject = "opcua/write/result"
+	}
+	if c.MQTT.Topic == "" {
+		c.MQTT.Topic = "opcua/data"
+	}
+	if c.MQTT.KeepAliveSec <= 0 {
+		c.MQTT.KeepAliveSec = 60
+	}
+	if c.MQTT.ConnectTimeoutSec <= 0 {
+		c.MQTT.ConnectTimeoutSec = 10
+	}
+	if c.MQTT.PublishTimeoutSec <= 0 {
+		c.MQTT.PublishTimeoutSec = 5
+	}
+	if c.MQTT.MaxReconnectDelaySec <= 0 {
+		c.MQTT.MaxReconnectDelaySec = 60
 	}
 	return nil
 }

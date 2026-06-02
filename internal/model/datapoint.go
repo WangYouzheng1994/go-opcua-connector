@@ -1,20 +1,57 @@
 // Package model defines core data structures for OPC UA data points and collector statistics.
 package model
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
 
 // DataPoint OPC UA数据点模型
 type DataPoint struct {
-	// NodeID OPC UA节点ID
-	NodeID string `json:"node_id"`
-	// Value 数据点的实际值
-	Value any `json:"value"`
-	// Quality 品质，取值为 Good/Bad/Uncertain/Stale
-	Quality string `json:"quality"`
-	// Timestamp 数据时间戳
+	NodeID    string    `json:"node_id"`
+	Value     any       `json:"value"`
+	Quality   string    `json:"quality"`
 	Timestamp time.Time `json:"timestamp"`
-	// Topic NATS主题
-	Topic string `json:"topic"`
+}
+
+// BatchPoint 批量推送中的单条数据点（精简字段名）
+type BatchPoint struct {
+	ID string `json:"id"`
+	V  any    `json:"v"`
+	Q  bool   `json:"q"`
+	T  int64  `json:"t"`
+}
+
+// BatchMessage 批量推送消息结构
+type BatchMessage struct {
+	Timestamp int64        `json:"timestamp"`
+	Values    []BatchPoint `json:"values"`
+}
+
+// NewBatchMessage 将DataPoint列表转换为批量推送消息。
+func NewBatchMessage(points []DataPoint) BatchMessage {
+	values := make([]BatchPoint, len(points))
+	for i, p := range points {
+		values[i] = BatchPoint{
+			ID: stripNamespace(p.NodeID),
+			V:  p.Value,
+			Q:  p.Quality == "Good",
+			T:  p.Timestamp.UnixMilli(),
+		}
+	}
+	return BatchMessage{
+		Timestamp: time.Now().UnixMilli(),
+		Values:    values,
+	}
+}
+
+func stripNamespace(nodeID string) string {
+	idx := strings.Index(nodeID, ";s=")
+	if idx >= 0 {
+		return nodeID[idx+3:]
+	}
+	return nodeID
 }
 
 // NATSMessage NATS消息发布结构
@@ -44,7 +81,7 @@ type NodeDataState struct {
 	Dirty bool
 }
 
-// WriteCommand NATS回写命令，由外部系统通过NATS发送
+// WriteCommand 回写命令，由外部系统通过消息队列发送
 type WriteCommand struct {
 	// NodeID 目标OPC UA节点ID
 	NodeID string `json:"node_id"`
@@ -55,6 +92,33 @@ type WriteCommand struct {
 	ValueType string `json:"value_type,omitempty"`
 	// RequestID 请求标识，用于结果关联
 	RequestID string `json:"request_id,omitempty"`
+}
+
+// BatchWriteItem 批量回写命令中的单条（精简字段名，与推送格式对应）
+type BatchWriteItem struct {
+	ID string `json:"id"`
+	V  any    `json:"v"`
+}
+
+// ToWriteCommand 转换为内部 WriteCommand，nodeIDPrefix 用于还原完整节点ID。
+func (b BatchWriteItem) ToWriteCommand(nodeIDPrefix string) WriteCommand {
+	nodeID := b.ID
+	if nodeIDPrefix != "" && !strings.Contains(nodeID, ";s=") {
+		nodeID = nodeIDPrefix + nodeID
+	}
+	value := ""
+	switch v := b.V.(type) {
+	case string:
+		value = v
+	case float64:
+		value = fmt.Sprintf("%v", v)
+	default:
+		value = fmt.Sprintf("%v", v)
+	}
+	return WriteCommand{
+		NodeID: nodeID,
+		Value:  value,
+	}
 }
 
 // WriteResult NATS回写结果

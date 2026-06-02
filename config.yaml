@@ -18,7 +18,24 @@ nats:
   max_reconnects: -1
   reconnect_wait_ms: 1000
 
+mqtt:
+  brokers: tcp://192.168.0.61:1883
+  client_id: "xiaolu_go_opcua"
+  username: ""
+  password: ""
+  topic: go_opcua/data
+  qos: 0
+  retained: false
+  clean_session: true
+  keepalive_sec: 60
+  connect_timeout_sec: 10
+  publish_timeout_sec: 5
+  auto_reconnect: true
+  max_reconnect_delay_sec: 60
+  insecure_skip_verify: false
+
 collector:
+  output_type: mqtt
   worker_count: 10
   batch_size: 100
   channel_buffer_size: 10000
@@ -31,8 +48,8 @@ collector:
   push_interval_sec: 1
   force_heartbeat: true
   subscription_nodes:
-    - ns=2;s=test.d1.*
-    - ns=2;s=test.t2.*
+    - ns=2;s=t1.d1.*
+    - ns=2;s=t1.d2.*
 
 writeback:
   write_subject: opcua/write

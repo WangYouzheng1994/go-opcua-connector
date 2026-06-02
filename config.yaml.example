@@ -123,8 +123,70 @@ nats:
   reconnect_wait_ms: 1000
 
 
+# -------------------- MQTT 消息中间件配置（output_type=mqtt 时生效） --------------------
+mqtt:
+  # MQTT Broker地址
+  # 类型：字符串，多个用逗号分隔
+  # 示例：tcp://localhost:1883 或 ssl://mqtt.example.com:8883
+  brokers: tcp://localhost:1883
+
+  # 客户端ID（MQTT协议要求唯一，为空自动生成）
+  client_id: ""
+
+  # 用户名/密码（Broker认证，默认空=匿名）
+  username: ""
+  password: ""
+
+  # 发布主题，默认 opcua/data
+  topic: opcua/data
+
+  # 服务质量：0=最多一次 1=至少一次 2=恰好一次，默认0
+  qos: 0
+
+  # 保留消息：新订阅者是否立即收到最新数据，默认false
+  retained: false
+
+  # 清除会话：断开后Broker是否清除未发送消息，默认true
+  clean_session: true
+
+  # 心跳间隔，单位秒，默认60
+  keepalive_sec: 60
+
+  # 连接超时，单位秒，默认10
+  connect_timeout_sec: 10
+
+  # 发布超时，单位秒，默认5
+  publish_timeout_sec: 5
+
+  # 自动重连，默认true
+  auto_reconnect: true
+
+  # 最大重连间隔，单位秒，默认60
+  max_reconnect_delay_sec: 60
+
+  # TLS客户端证书（可选，双向TLS）
+  # tls_cert_file: ""
+  # tls_key_file: ""
+
+  # TLS CA证书（可选，验证Broker证书）
+  # tls_ca_file: ""
+
+  # 跳过TLS证书验证（仅测试环境！）
+  insecure_skip_verify: false
+
+
 # -------------------- 数据采集器配置 --------------------
 collector:
+  # 输出目标类型
+  # 类型：字符串，可选值 nats / mqtt
+  # 默认值：nats
+  # 说明：
+  #   - nats：推送到NATS（默认，向后兼容）
+  #   - mqtt：推送到MQTT
+  # 注意：
+  #   - nats 模式需要配置 nats 节
+  #   - mqtt 模式需要配置 mqtt 节
+  output_type: nats
   # 并发Worker数量
   # 类型：整数
   # 默认值：10
@@ -263,20 +325,22 @@ collector:
 
 # -------------------- 点位回写配置 --------------------
 writeback:
-  # 接收回写命令的NATS主题
+  # 接收回写命令的主题
   # 类型：字符串
   # 默认值：opcua/write
   # 说明：外部系统发回写命令到此主题，程序收到后执行OPC UA写操作
+  # 注：主题类型取决于 output_type — nats 模式下为 NATS Subject，mqtt 模式下为 MQTT Topic
   # 消息格式：
   #   {"node_id":"ns=2;s=t1.d1.Temperature","value":"25.5","value_type":"float64","request_id":"abc123"}
   #   value_type 可选：int32 / int64 / float32 / float64 / bool / string
   #   value_type 为空时自动推断类型
   write_subject: opcua/write
 
-  # 发布回写结果的NATS主题
+  # 发布回写结果的主题
   # 类型：字符串
   # 默认值：opcua/write/result
   # 说明：每次回写操作完成后，发布结果到此主题
+  # 注：主题类型取决于 output_type
   # 结果格式：
   #   {"node_id":"ns=2;s=t1.d1.Temperature","success":true,"written_value":25.5,"request_id":"abc123"}
   result_subject: opcua/write/result

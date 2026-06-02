@@ -1,4 +1,4 @@
-// Command go-opcua-connector connects to OPC UA servers, collects data points, and forwards them to NATS.io.
+// Command go-opcua-connector connects to OPC UA servers, collects data points, and forwards them to message brokers.
 package main
 
 import (
@@ -8,10 +8,12 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"go-opcua-connector/internal/collector"
 	"go-opcua-connector/internal/config"
+	"go-opcua-connector/internal/mqtt"
 	"go-opcua-connector/internal/nats"
 	"go-opcua-connector/internal/opcua"
 	"go-opcua-connector/internal/writeback"
@@ -48,37 +50,56 @@ func main() {
 	// 创建新的OPC UA客户端
 	opcuaClient := opcua.NewClient(&cfg.OPCUA, logger)
 
-	// opcua 连接
+	// OPC UA 连接
 	if err := opcuaClient.Connect(ctx); err != nil {
 		logger.Fatal("Failed to connect to OPC UA", zap.Error(err))
 	}
 	defer opcuaClient.Close()
 
-	// natsio 连接
-	natsClient := nats.NewClient(&cfg.NATS, logger)
-	if err := natsClient.Connect(ctx); err != nil {
-		logger.Warn("Failed to connect to NATS, continuing without NATS", zap.Error(err))
-	} else {
+	var (
+		publisher   collector.Publisher
+		wbTransport writeback.Transport
+	)
+
+	switch cfg.Collector.OutputType {
+	case config.OutputTypeNATS:
+		natsClient := nats.NewClient(&cfg.NATS, logger)
+		if err := natsClient.Connect(ctx); err != nil {
+			logger.Fatal("Failed to connect to NATS", zap.Error(err))
+		}
 		defer natsClient.Close()
+		publisher = natsClient
+		wbTransport = natsClient
+
+	case config.OutputTypeMQTT:
+		mqttClient := mqtt.NewClient(&cfg.MQTT, logger)
+		if err := mqttClient.Connect(ctx); err != nil {
+			logger.Fatal("Failed to connect to MQTT", zap.Error(err))
+		}
+		defer mqttClient.Close()
+		publisher = mqttClient
+		wbTransport = mqttClient
 	}
 
-	col := collector.New(&cfg.Collector, opcuaClient, natsClient, logger)
-	// 采集上送入口
+	col := collector.New(&cfg.Collector, opcuaClient, publisher, logger)
 	if err := col.Start(); err != nil {
 		logger.Fatal("Failed to start collector", zap.Error(err))
 	}
 	defer col.Stop()
 
-	// 初始化回写处理器
-	writebackHandler := writeback.NewHandler(opcuaClient, natsClient, &cfg.Writeback, logger)
-	if err := writebackHandler.Start(ctx); err != nil {
-		logger.Warn("Failed to start writeback handler, writeback disabled", zap.Error(err))
-	} else {
-		defer writebackHandler.Stop()
+	if wbTransport != nil {
+		nodeIDPrefix := extractNodeIDPrefix(cfg.Collector.SubscriptionNodes)
+		wbEngine := writeback.NewEngine(opcuaClient, wbTransport, &cfg.Writeback, nodeIDPrefix, logger)
+		if err := wbEngine.Start(ctx); err != nil {
+			logger.Warn("Failed to start writeback engine, writeback disabled", zap.Error(err))
+		} else {
+			defer wbEngine.Stop()
+		}
 	}
 
 	logger.Info("go-opcua-connector started successfully",
 		zap.String("app_name", cfg.AppName),
+		zap.String("output_type", string(cfg.Collector.OutputType)),
 		zap.Int("workers", cfg.Collector.WorkerCount),
 		zap.Int("batch_size", cfg.Collector.BatchSize))
 
@@ -88,6 +109,16 @@ func main() {
 	// 等待信号（阻塞）
 	<-sigCh
 	logger.Info("Received shutdown signal, stopping...")
+}
+
+func extractNodeIDPrefix(nodes []string) string {
+	for _, node := range nodes {
+		idx := strings.Index(node, ";s=")
+		if idx >= 0 {
+			return node[:idx+3]
+		}
+	}
+	return ""
 }
 
 func initLogger() *zap.Logger {

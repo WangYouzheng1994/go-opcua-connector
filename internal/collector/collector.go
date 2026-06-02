@@ -4,13 +4,13 @@ package collector
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go-opcua-connector/internal/config"
 	"go-opcua-connector/internal/model"
-	"go-opcua-connector/internal/nats"
 	"go-opcua-connector/internal/opcua"
 
 	"go.uber.org/zap"
@@ -27,8 +27,8 @@ type Collector struct {
 	config *config.CollectorConfig
 	// opcuaClient OPC UA客户端
 	opcuaClient *opcua.Client
-	// natsClient NATS客户端
-	natsClient *nats.Client
+	// publisher 发布器，由配置决定是 NATS 还是 MQTT
+	publisher Publisher
 	// logger 日志记录器
 	logger *zap.Logger
 
@@ -71,7 +71,7 @@ type Collector struct {
 func New(
 	cfg *config.CollectorConfig,
 	opcuaClient *opcua.Client,
-	natsClient *nats.Client,
+	publisher Publisher,
 	logger *zap.Logger,
 ) *Collector {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -79,7 +79,7 @@ func New(
 	return &Collector{
 		config:      cfg,
 		opcuaClient: opcuaClient,
-		natsClient:  natsClient,
+		publisher:   publisher,
 		logger:      logger,
 		subCh:       make(chan []model.DataPoint, cfg.ChannelBufferSize),
 		pubCh:       make(chan model.DataPoint, cfg.ChannelBufferSize),
@@ -254,6 +254,10 @@ func (c *Collector) subWorker(id int) {
 
 // handleDataPoint 处理单个数据点，更新内存池并根据模式决定推送
 func (c *Collector) handleDataPoint(point *model.DataPoint) {
+	if strings.HasPrefix(point.Quality, "Bad") && point.Value == nil {
+		return
+	}
+
 	c.nodeStatesMu.Lock()
 
 	state, exists := c.nodeStates[point.NodeID]
@@ -284,7 +288,6 @@ func (c *Collector) handleDataPoint(point *model.DataPoint) {
 	// immediate 模式：立即发送当前数据点
 	if c.config.PushMode == config.PushModeImmediate {
 		pointCopy := *point
-		pointCopy.Topic = c.getTopic()
 		c.nodeStatesMu.Unlock()
 		// 非阻塞发送，防止 OPC UA 回调线程被阻塞
 		select {
@@ -395,7 +398,6 @@ func (c *Collector) handleHeartbeatResult(point *model.DataPoint) {
 				Value:     state.Value,
 				Quality:   state.Quality,
 				Timestamp: state.Timestamp,
-				Topic:     c.getTopic(),
 			}
 			c.nodeStatesMu.Unlock()
 			c.pubCh <- pointCopy
@@ -421,7 +423,6 @@ func (c *Collector) checkStaleNodes(threshold time.Duration) {
 
 	now := time.Now()
 	var toPublish []model.DataPoint
-	topic := c.getTopic()
 
 	for nodeID, state := range c.nodeStates {
 		age := now.Sub(state.Timestamp)
@@ -440,7 +441,6 @@ func (c *Collector) checkStaleNodes(threshold time.Duration) {
 						Value:     state.Value,
 						Quality:   "Stale",
 						Timestamp: now,
-						Topic:     topic,
 					})
 				} else {
 					state.Dirty = true
@@ -519,9 +519,11 @@ func (c *Collector) publishWorkerTimed() {
 func (c *Collector) pushDirtyNodes() {
 	c.nodeStatesMu.Lock()
 	batch := make([]model.DataPoint, 0, len(c.nodeStates))
-	topic := c.getTopic()
 
 	for _, state := range c.nodeStates {
+		if strings.HasPrefix(state.Quality, "Bad") && state.Value == nil {
+			continue
+		}
 		// 无论 Dirty 是否为 true，都推送全量数据
 		// 这是固定周期推送的核心：保证下游持续收到数据
 		batch = append(batch, model.DataPoint{
@@ -529,7 +531,6 @@ func (c *Collector) pushDirtyNodes() {
 			Value:     state.Value,
 			Quality:   state.Quality,
 			Timestamp: state.Timestamp,
-			Topic:     topic,
 		})
 	}
 	c.nodeStatesMu.Unlock()
@@ -550,7 +551,7 @@ func (c *Collector) processBatch(batch []model.DataPoint) {
 	ctx, cancel := context.WithTimeout(c.ctx, time.Duration(c.config.PublishTimeoutMs)*time.Millisecond)
 	defer cancel()
 
-	err := c.natsClient.PublishBatch(ctx, c.getTopic(), batch)
+	err := c.publisher.PublishBatch(ctx, c.getTopic(), batch)
 
 	latency := time.Since(start).Milliseconds()
 
@@ -587,12 +588,12 @@ func (c *Collector) monitorStats() {
 			dropped := c.droppedPoints.Load()
 
 			stats := &model.CollectorStats{
-				TotalPoints:    total,
-				SuccessCount:   success,
-				FailureCount:   fail,
-				StaleCount:     stale,
-				DroppedPoints:  dropped,
-				AvgLatencyMs:   0,
+				TotalPoints:   total,
+				SuccessCount:  success,
+				FailureCount:  fail,
+				StaleCount:    stale,
+				DroppedPoints: dropped,
+				AvgLatencyMs:  0,
 			}
 
 			if success > 0 {
