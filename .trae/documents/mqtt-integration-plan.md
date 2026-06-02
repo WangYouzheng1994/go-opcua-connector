@@ -27,9 +27,9 @@ collector:
 | `internal/config/loader.go` | 修改 | 新增 MQTT 默认值 |
 | `internal/nats/client.go` | 修改 | 删除冗余统计代码 + Context 响应 + 实现 Transport 接口 |
 | `internal/collector/collector.go` | 修改 | `natsClient` → `publisher Publisher`，移除 NATS 硬依赖 |
-| `internal/model/datapoint.go` | 修改 | 删除 DataPoint.Topic，新增 BatchMessage/BatchPoint 序列化结构 |
+| `internal/model/datapoint.go` | 修改 | 删除 DataPoint.Topic；新增 BatchMessage/BatchPoint/BatchWriteItem 及序列化/转换方法 |
 | `internal/opcua/client.go` | 修改 | 删除 DataPoint.Topic 赋值 |
-| `cmd/main.go` | 修改 | 按 output_type 组装 Publisher 和 Transport |
+| `cmd/main.go` | 修改 | 按 output_type 组装 Publisher 和 Transport；新增 extractNodeIDPrefix() |
 | `config.yaml` | 修改 | 新增 `output_type` + `mqtt` 配置节 |
 | `config.yaml.example` | 修改 | 同步更新配置模板和注释 |
 | `go.mod` | 修改 | 新增 `github.com/eclipse/paho.mqtt.golang` 依赖 |
@@ -127,11 +127,11 @@ case <-ctx.Done():
 
 ### 4.4 DataPoint.Topic 移除
 
-**问题**：每条 DataPoint 内嵌 `Topic` 字段，但批量消息顶层已有 topic，点级 topic 冗余。且 MQTT 模式下 DataPoint.topic 来自 collector.subscription_topic，与实际发布目标 mqtt.topic 不一致。
+**问题**：每条 DataPoint 内嵌 `Topic` 字段，批量消息已不携带 topic。MQTT 模式下 topic 由 mqtt.topic 配置控制，由 PublishBatch 内部处理，点级冗余 topic 无意义且造成混淆。
 
-**修复**：从 DataPoint 删除 `Topic` 字段。批量消息的 topic 由 PublishBatch 内部根据实际发布目标设置。
+**修复**：从 DataPoint 删除 `Topic` 字段，opcua/client.go 和 collector.go 中所有 Topic 赋值一并删除。
 
-### 4.5 输出格式统一
+### 4.5 输出格式统一 & NodeID 精简
 
 **改造后输出格式**（NATS 和 MQTT 共用）：
 
@@ -152,12 +152,12 @@ case <-ctx.Done():
 | 字段 | 来源 | 说明 |
 |------|------|------|
 | `timestamp` | `time.Now().UnixMilli()` | 批量消息生成时间 |
-| `values[].id` | DataPoint.NodeID 去 `ns=N;s=` 前缀 | 简短节点标识 |
+| `values[].id` | DataPoint.NodeID 去 `ns=N;s=` 前缀 | `ns=2;s=t1.d1.t4` → `t1.d1.t4` |
 | `values[].v` | DataPoint.Value | 数据值 |
 | `values[].q` | DataPoint.Quality == "Good" | bool 品质 |
 | `values[].t` | DataPoint.Timestamp.UnixMilli() | 数据时间戳 |
 
-序列化逻辑统一在 [model/datapoint.go](file:///e:/ls/ProjectCollection/go-opcua-connector/internal/model/datapoint.go) 的 `NewBatchMessage()` 函数中，NATS 和 MQTT 共用。
+序列化逻辑统一在 [model/datapoint.go](file:///e:/ls/ProjectCollection/go-opcua-connector/internal/model/datapoint.go) 的 `NewBatchMessage()` 函数中，NATS 和 MQTT 共用。`stripNamespace()` 函数负责裁剪 NodeID 前缀。
 
 ### 4.6 非叶子节点过滤
 
@@ -167,9 +167,42 @@ case <-ctx.Done():
 - `handleDataPoint` 入口：Quality 以 "Bad" 开头且 Value == nil 的数据点直接丢弃
 - `pushDirtyNodes` 遍历：同理跳过 Bad+null 的节点
 
----
+### 4.7 回写命令格式兼容
 
+**问题**：Writeback 只支持旧格式 `{"node_id":"...","value":"..."}`，与推送的新格式 `{"id":"...","v":...}` 不一致。
+
+**修复**：`handleMessage` 先尝试解析新格式数组，失败回退旧格式单对象。新增 `BatchWriteItem` 结构体自动还原 NodeID 前缀并转换值类型：
+
+```go
+// engine.go handleMessage 逻辑
+var items []model.BatchWriteItem
+if err := json.Unmarshal(data, &items); err == nil && len(items) > 0 {
+    for _, item := range items {
+        cmd := item.ToWriteCommand(e.nodeIDPrefix)  // id→node_id , v→value
+        e.processWriteCommand(&cmd)
+    }
+    return
+}
+// 兼容旧格式
+var cmd model.WriteCommand
+json.Unmarshal(data, &cmd)
+```
+
+| 格式 | 示例 | 状态 |
+|------|------|------|
+| 新格式（数组） | `[{"id":"t1.d1.t5","v":123}]` | ✅ 优先匹配 |
+| 旧格式（单对象） | `{"node_id":"ns=2;s=t1.d1.t5","value":"123"}` | ✅ 兼容回退 |
+
+### 4.8 NodeID 命名空间前缀提取
+
+**问题**：推送时裁剪了 `ns=2;s=` 前缀，回写时需要还原完整 NodeID 才能执行 OPC UA 写操作。
+
+**修复**：`cmd/main.go` 的 `extractNodeIDPrefix()` 从 `collector.subscription_nodes` 配置中提取 `ns=N;s=` 前缀，传入 `writeback.Engine`。`BatchWriteItem.ToWriteCommand(prefix)` 自动为短 ID 补全前缀。
+
+---
 ## 五、MQTT 配置说明
+
+### 5.1 数据输出配置
 
 ```yaml
 collector:
@@ -192,9 +225,41 @@ mqtt:
   insecure_skip_verify: false        # TLS 跳过验证（仅测试）
 ```
 
+### 5.2 回写命令格式
+
+回写 topic 由 `writeback.write_subject` 配置，NATS 模式下为 subject，MQTT 模式下为 MQTT topic，无需额外配置。
+
+**推荐格式（与推送一致）：**
+```json
+[{"id":"t1.d1.t5","v":123}]
+```
+
+**兼容旧格式：**
+```json
+{"node_id":"ns=2;s=t1.d1.t5","value":"123"}
+```
+
+回写结果发布到 `writeback.result_subject`，格式：
+```json
+{"node_id":"ns=2;s=t1.d1.t5","success":true,"written_value":123}
+```
+
 ---
 
-## 六、扩展性
+## 六、新增模型结构体一览
+
+| 结构体 | 位置 | 用途 |
+|--------|------|------|
+| `Publisher` | collector/publisher.go | Collector 数据输出抽象接口 |
+| `Transport` | writeback/transport.go | Writeback 传输层抽象接口 |
+| `Subscription` | writeback/transport.go | 订阅句柄接口 |
+| `BatchPoint` | model/datapoint.go | 批量推送中的单条数据点（精简字段） |
+| `BatchMessage` | model/datapoint.go | 批量推送消息结构 |
+| `BatchWriteItem` | model/datapoint.go | 批量回写命令中的单条（与推送格式对应） |
+| `OutputType` | config/config.go | 输出目标类型常量（nats/mqtt） |
+| `MQTTConfig` | config/config.go | MQTT 连接配置结构体 |
+
+## 七、扩展性
 
 未来接入 Kafka / RabbitMQ / Pulsar 等中间件时：
 
