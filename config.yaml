@@ -1,5 +1,10 @@
 app_name: go-opcua-connector
-log_level: info
+
+log:
+  level: info
+  dir: ./logs
+  max_age_day: 3
+  max_size_mb: 100
 
 opcua:
   endpoint: opc.tcp://localhost:49320

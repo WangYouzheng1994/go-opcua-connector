@@ -13,18 +13,28 @@ import (
 
 	"go-opcua-connector/internal/collector"
 	"go-opcua-connector/internal/config"
+	"go-opcua-connector/internal/logging"
 	"go-opcua-connector/internal/mqtt"
 	"go-opcua-connector/internal/nats"
 	"go-opcua-connector/internal/opcua"
 	"go-opcua-connector/internal/writeback"
 
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 // main 主程序入口
 func main() {
-	logger := initLogger()
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	logger, err := logging.NewLogger(&cfg.Log)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
 	defer logger.Sync()
 
 	logger.Info("Starting go-opcua-connector...")
@@ -36,11 +46,6 @@ func main() {
 			logger.Warn("pprof server stopped", zap.Error(err))
 		}
 	}()
-
-	cfg, err := loadConfig()
-	if err != nil {
-		logger.Fatal("Failed to load config", zap.Error(err))
-	}
 
 	// 初始化通知器
 	ctx, cancel := context.WithCancel(context.Background())
@@ -119,38 +124,6 @@ func extractNodeIDPrefix(nodes []string) string {
 		}
 	}
 	return ""
-}
-
-func initLogger() *zap.Logger {
-	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:        "time",
-		LevelKey:       "level",
-		NameKey:        "logger",
-		CallerKey:      "caller",
-		MessageKey:     "msg",
-		StacktraceKey:  "stacktrace",
-		LineEnding:     zapcore.DefaultLineEnding,
-		EncodeLevel:    zapcore.LowercaseLevelEncoder,
-		EncodeTime:     zapcore.ISO8601TimeEncoder,
-		EncodeDuration: zapcore.MillisDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
-
-	config := zap.Config{
-		Level:            zap.NewAtomicLevelAt(zap.InfoLevel),
-		Development:      false,
-		Encoding:         "console",
-		EncoderConfig:    encoderConfig,
-		OutputPaths:      []string{"stdout"},
-		ErrorOutputPaths: []string{"stderr"},
-	}
-
-	logger, err := config.Build()
-	if err != nil {
-		panic(fmt.Sprintf("failed to initialize logger: %v", err))
-	}
-
-	return logger
 }
 
 func loadConfig() (*config.AppConfig, error) {

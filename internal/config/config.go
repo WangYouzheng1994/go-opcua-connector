@@ -116,12 +116,24 @@ type WritebackConfig struct {
 	ResultSubject string `mapstructure:"result_subject"`
 }
 
+// LogConfig 日志配置
+type LogConfig struct {
+	// Level 日志级别，可选 debug/info/warn/error，默认 info
+	Level string `mapstructure:"level"`
+	// Dir 日志文件存放目录，默认 ./logs
+	Dir string `mapstructure:"dir"`
+	// MaxAgeDay 日志保留天数，默认 3
+	MaxAgeDay int `mapstructure:"max_age_day"`
+	// MaxSizeMB 单个日志文件最大大小（MB），默认 100
+	MaxSizeMB int `mapstructure:"max_size_mb"`
+}
+
 // AppConfig 应用配置
 type AppConfig struct {
 	// AppName 应用名称，默认 go-opcua-connector
 	AppName string `mapstructure:"app_name"`
-	// LogLevel 日志级别，可选 debug/info/warn/error，默认 info
-	LogLevel string `mapstructure:"log_level"`
+	// Log 日志配置
+	Log LogConfig `mapstructure:"log"`
 	// OPCUA OPC UA服务器配置
 	OPCUA OPCUAConfig `mapstructure:"opcua"`
 	// NATS NATS服务器配置
@@ -137,6 +149,19 @@ type AppConfig struct {
 func (c *AppConfig) Validate() error {
 	if c.OPCUA.Endpoint == "" {
 		return fmt.Errorf("OPC UA endpoint is required")
+	}
+
+	if c.Log.Level == "" {
+		c.Log.Level = "info"
+	}
+	if c.Log.Dir == "" {
+		c.Log.Dir = "./logs"
+	}
+	if c.Log.MaxAgeDay <= 0 {
+		c.Log.MaxAgeDay = 3
+	}
+	if c.Log.MaxSizeMB <= 0 {
+		c.Log.MaxSizeMB = 100
 	}
 
 	if c.Collector.OutputType == "" {
