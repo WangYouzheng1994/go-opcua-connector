@@ -3,8 +3,12 @@ package opcua
 
 import (
 	"context"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,35 +59,84 @@ func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 	}
 }
 
-// Connect 连接到OPC UA服务器
+// Connect 连接到OPC UA服务器，包含端点发现、安全协商、会话建立。1
 func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	endpoint := c.config.Endpoint
 
+	// 第一步：加载客户端证书和私钥（支持 PEM/DER 证书，PKCS#1/PKCS#8 私钥）。
+	var certOpt, keyOpt opcua.Option
+	if c.config.Certificate != "" && c.config.PrivateKey != "" {
+		cert, err := loadCertFile(c.config.Certificate)
+		if err != nil {
+			return fmt.Errorf("failed to load certificate: %w", err)
+		}
+		key, err := loadPrivateKeyFile(c.config.PrivateKey)
+		if err != nil {
+			return fmt.Errorf("failed to load private key: %w", err)
+		}
+		certOpt = opcua.Certificate(cert)
+		keyOpt = opcua.PrivateKey(key)
+		c.logger.Info("Loading client certificate",
+			zap.String("certificate", c.config.Certificate),
+			zap.String("private_key", c.config.PrivateKey))
+	}
+
+	// 第二步：端点发现，获取服务器端点列表（含服务器证书）。
+	getEndpointsOpts := []opcua.Option{
+		opcua.RequestTimeout(time.Duration(c.config.RequestTimeout) * time.Second),
+	}
+	if certOpt != nil {
+		getEndpointsOpts = append(getEndpointsOpts, certOpt)
+	}
+
+	c.logger.Info("Discovering OPC UA endpoints...", zap.String("endpoint", endpoint))
+	endpoints, err := opcua.GetEndpoints(ctx, endpoint, getEndpointsOpts...)
+	if err != nil {
+		return fmt.Errorf("failed to get endpoints: %w", err)
+	}
+
+	// 第三步：选择匹配的端点（按安全策略+安全模式筛选）。
+	selectedEp := opcua.SelectEndpoint(endpoints, c.config.SecurityPolicy, c.parseSecurityMode())
+	if selectedEp == nil {
+		c.logger.Warn("No matching endpoint found, falling back to None security",
+			zap.String("policy", c.config.SecurityPolicy),
+			zap.String("mode", c.config.SecurityMode))
+		selectedEp = opcua.SelectEndpoint(endpoints, ua.SecurityPolicyURINone, ua.MessageSecurityModeNone)
+	}
+	if selectedEp == nil {
+		return fmt.Errorf("no suitable endpoint found for policy=%s mode=%s", c.config.SecurityPolicy, c.config.SecurityMode)
+	}
+	c.logger.Info("Selected OPC UA endpoint",
+		zap.String("security_policy", selectedEp.SecurityPolicyURI),
+		zap.Any("security_mode", selectedEp.SecurityMode))
+
+	// 第四步：使用 SecurityFromEndpoint 构建客户端选项（自动配置服务器证书）。
 	opts := []opcua.Option{
-		opcua.SecurityPolicy(c.config.SecurityPolicy),
-		opcua.SecurityMode(c.parseSecurityMode()),
+		opcua.SecurityFromEndpoint(selectedEp, ua.UserTokenTypeAnonymous),
 		opcua.RequestTimeout(time.Duration(c.config.RequestTimeout) * time.Second),
 		opcua.SessionTimeout(1 * time.Hour),
 		opcua.Lifetime(2 * time.Hour),
 	}
-
+	if certOpt != nil {
+		opts = append(opts, certOpt, keyOpt)
+	}
 	if c.config.Username != "" && c.config.Password != "" {
 		opts = append(opts, opcua.AuthUsername(c.config.Username, c.config.Password))
 	}
 
-	// 初始化opcua的客户端
+	// 第五步：创建客户端并连接。
 	client, err := opcua.NewClient(endpoint, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create client: %w", err)
 	}
-
 	c.client = client
 
 	c.logger.Info("Connecting to OPC UA server (TCP + Session)...")
 	if err := client.Connect(ctx); err != nil {
+		c.client = nil
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
@@ -94,7 +147,11 @@ func (c *Client) Connect(ctx context.Context) error {
 // Subscribe 创建订阅并注册监控项。
 // 节点数>5000时自动拆分为多个Subscription分摊KepServer内部负载。
 func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, handler DataChangeHandler) error {
-	if c.client == nil {
+	c.mu.RLock()
+	cli := c.client
+	c.mu.RUnlock()
+
+	if cli == nil {
 		return fmt.Errorf("client not connected, call Connect() first")
 	}
 
@@ -132,7 +189,7 @@ func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, ha
 		itemsInSub := monitorItems[subStart:subEnd]
 
 		subCh := make(chan *opcua.PublishNotificationData, 100)
-		sub, err := c.client.Subscribe(ctx, &opcua.SubscriptionParameters{
+		sub, err := cli.Subscribe(ctx, &opcua.SubscriptionParameters{
 			Interval: 100,
 		}, subCh)
 		if err != nil {
@@ -252,14 +309,15 @@ func (c *Client) handleNotifications(
 	}
 }
 
-// Close 关闭客户端连接
+// Close 关闭客户端连接，不在持锁期间执行网络I/O。
 func (c *Client) Close() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	cli := c.client
+	c.client = nil
+	c.mu.Unlock()
 
-	if c.client != nil {
-		c.client.Close(context.Background())
-		c.client = nil
+	if cli != nil {
+		cli.Close(context.Background())
 	}
 
 	c.logger.Info("OPC UA client closed")
@@ -289,6 +347,51 @@ func (c *Client) parseSecurityMode() ua.MessageSecurityMode {
 	default:
 		return ua.MessageSecurityModeNone
 	}
+}
+
+// loadCertFile 加载证书文件，自动检测 PEM 或 DER 格式。
+func loadCertFile(filename string) ([]byte, error) {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read certificate file: %w", err)
+	}
+	// 不看扩展名，直接检测内容是否为 PEM 格式。
+	block, _ := pem.Decode(b)
+	if block != nil && block.Type == "CERTIFICATE" {
+		return block.Bytes, nil
+	}
+	return b, nil
+}
+
+// loadPrivateKeyFile 加载私钥文件，自动检测 PEM/DER 格式，兼容 PKCS#1 和 PKCS#8。
+func loadPrivateKeyFile(filename string) (*rsa.PrivateKey, error) {
+	b, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key file: %w", err)
+	}
+
+	derBytes := b
+	// 不看扩展名，直接检测内容是否为 PEM 格式。
+	block, _ := pem.Decode(b)
+	if block != nil {
+		derBytes = block.Bytes
+	}
+
+	// 优先尝试 PKCS#1 格式。
+	if key, err := x509.ParsePKCS1PrivateKey(derBytes); err == nil {
+		return key, nil
+	}
+
+	// 回退到 PKCS#8 格式。
+	keyAny, err := x509.ParsePKCS8PrivateKey(derBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key (tried PKCS#1 and PKCS#8): %w", err)
+	}
+	key, ok := keyAny.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("private key is not RSA (type: %T)", keyAny)
+	}
+	return key, nil
 }
 
 // IsConnected 检查连接状态
@@ -435,9 +538,10 @@ func (c *Client) browseAllLeaves(ctx context.Context, nodeID *ua.NodeID) ([]stri
 // Read 读取单个节点的值（主动拉取）
 func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	cli := c.client
+	c.mu.RUnlock()
 
-	if c.client == nil {
+	if cli == nil {
 		return nil, fmt.Errorf("client not connected")
 	}
 
@@ -458,7 +562,7 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 		TimestampsToReturn: ua.TimestampsToReturnBoth,
 	}
 
-	resp, err := c.client.Read(ctx, req)
+	resp, err := cli.Read(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
@@ -483,9 +587,10 @@ func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, err
 // ReadAll 批量读取多个节点的值（主动拉取，用于心跳验证）
 func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoint, error) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	cli := c.client
+	c.mu.RUnlock()
 
-	if c.client == nil {
+	if cli == nil {
 		return nil, fmt.Errorf("client not connected")
 	}
 
@@ -494,6 +599,7 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 	}
 
 	nodesToRead := make([]*ua.ReadValueID, 0, len(nodeIDs))
+	validNodeIDs := make([]string, 0, len(nodeIDs))
 	for _, nodeID := range nodeIDs {
 		id, err := ua.ParseNodeID(nodeID)
 		if err != nil {
@@ -506,6 +612,7 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 			IndexRange:   "",
 			DataEncoding: nil,
 		})
+		validNodeIDs = append(validNodeIDs, nodeID)
 	}
 
 	if len(nodesToRead) == 0 {
@@ -517,13 +624,13 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 		TimestampsToReturn: ua.TimestampsToReturnBoth,
 	}
 
-	resp, err := c.client.Read(ctx, req)
+	resp, err := cli.Read(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("read failed: %w", err)
 	}
 
-	points := make([]model.DataPoint, 0, len(nodeIDs))
-	for i, nodeID := range nodeIDs {
+	points := make([]model.DataPoint, 0, len(validNodeIDs))
+	for i, nodeID := range validNodeIDs {
 		if i >= len(resp.Results) {
 			break
 		}
@@ -546,9 +653,10 @@ func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoi
 // Write 向OPC UA服务器单个节点写入值
 func (c *Client) Write(ctx context.Context, nodeID string, value any) error {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	cli := c.client
+	c.mu.RUnlock()
 
-	if c.client == nil {
+	if cli == nil {
 		return fmt.Errorf("client not connected")
 	}
 
@@ -581,7 +689,7 @@ func (c *Client) Write(ctx context.Context, nodeID string, value any) error {
 		},
 	}
 
-	resp, err := c.client.Write(ctx, req)
+	resp, err := cli.Write(ctx, req)
 	if err != nil {
 		return fmt.Errorf("write failed: %w", err)
 	}
@@ -596,9 +704,10 @@ func (c *Client) Write(ctx context.Context, nodeID string, value any) error {
 // WriteAll 批量向OPC UA服务器写入值，每项含NodeID和对应值
 func (c *Client) WriteAll(ctx context.Context, items map[string]any) error {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
+	cli := c.client
+	c.mu.RUnlock()
 
-	if c.client == nil {
+	if cli == nil {
 		return fmt.Errorf("client not connected")
 	}
 
@@ -627,7 +736,7 @@ func (c *Client) WriteAll(ctx context.Context, items map[string]any) error {
 		NodesToWrite: nodesToWrite,
 	}
 
-	resp, err := c.client.Write(ctx, req)
+	resp, err := cli.Write(ctx, req)
 	if err != nil {
 		return fmt.Errorf("write failed: %w", err)
 	}
@@ -778,9 +887,9 @@ func typeIDToString(typeID *ua.NodeID) string {
 
 // coerceToInt 将字符串强制转换为有符号整数。
 // 三级回退策略：
-//   1. 数值解析：直接 ParseInt
-//   2. bool 映射： "true"/"1"→1, "false"/"0"→0
-//   3. 浮点截断：ParseFloat 后转换为整数，越界时报错
+//  1. 数值解析：直接 ParseInt
+//  2. bool 映射： "true"/"1"→1, "false"/"0"→0
+//  3. 浮点截断：ParseFloat 后转换为整数，越界时报错
 func coerceToInt(raw string, bitSize int) (int64, error) {
 	v, err := strconv.ParseInt(raw, 10, bitSize)
 	if err == nil {

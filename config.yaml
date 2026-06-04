@@ -8,12 +8,12 @@ log:
 
 opcua:
   endpoint: opc.tcp://localhost:49320
-  certificate: ""
-  private_key: ""
+  certificate: "C:/certs/client.der"
+  private_key: "C:/certs/client.key"
   username: ""
   password: ""
-  security_policy: None
-  security_mode: None
+  security_policy: Basic256
+  security_mode: SignAndEncrypt
   request_timeout: 200
 
 nats:
@@ -53,8 +53,7 @@ collector:
   push_interval_sec: 1
   force_heartbeat: true
   subscription_nodes:
-    - ns=2;s=t1.d1.*
-    - ns=2;s=t1.d2.*
+    - ns=2;s=BZ1#.nz.rsg.*
 
 writeback:
   write_subject: opcua/write
