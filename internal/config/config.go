@@ -132,6 +132,8 @@ type LogConfig struct {
 type AppConfig struct {
 	// AppName 应用名称，默认 go-opcua-connector
 	AppName string `mapstructure:"app_name"`
+	// PprofPort pprof性能分析端口，默认 6060
+	PprofPort int `mapstructure:"pprof_port"`
 	// Log 日志配置
 	Log LogConfig `mapstructure:"log"`
 	// OPCUA OPC UA服务器配置
@@ -149,6 +151,10 @@ type AppConfig struct {
 func (c *AppConfig) Validate() error {
 	if c.OPCUA.Endpoint == "" {
 		return fmt.Errorf("OPC UA endpoint is required")
+	}
+
+	if c.PprofPort <= 0 {
+		c.PprofPort = 6060
 	}
 
 	if c.Log.Level == "" {

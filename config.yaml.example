@@ -14,6 +14,12 @@ app_name: go-opcua-connector
 # 默认值：go-opcua-connector
 # 建议：保持默认即可
 
+# pprof性能分析端口
+# 类型：整数
+# 默认值：6060
+# 说明：通过 http://localhost:6060/debug/pprof 访问性能分析界面
+pprof_port: 6060
+
 # -------------------- 日志配置 --------------------
 log:
   # 日志输出级别

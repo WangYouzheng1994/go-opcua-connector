@@ -1,4 +1,5 @@
 app_name: go-opcua-connector
+pprof_port: 6023
 
 log:
   level: info
@@ -53,7 +54,7 @@ collector:
   push_interval_sec: 1
   force_heartbeat: true
   subscription_nodes:
-    - ns=2;s=BZ1#.nz.rsg.*
+    - ns=2;s=t1.d1.*
 
 writeback:
   write_subject: opcua/write

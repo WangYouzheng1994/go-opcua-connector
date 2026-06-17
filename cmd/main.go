@@ -40,7 +40,7 @@ func main() {
 	logger.Info("Starting go-opcua-connector...")
 
 	go func() {
-		pprofAddr := ":6060"
+		pprofAddr := fmt.Sprintf(":%d", cfg.PprofPort)
 		logger.Info("pprof endpoint listening", zap.String("addr", pprofAddr))
 		if err := http.ListenAndServe(pprofAddr, nil); err != nil {
 			logger.Warn("pprof server stopped", zap.Error(err))
