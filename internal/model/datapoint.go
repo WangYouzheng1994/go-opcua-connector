@@ -31,17 +31,18 @@ type BatchMessage struct {
 
 // NewBatchMessage 将DataPoint列表转换为批量推送消息。
 func NewBatchMessage(points []DataPoint) BatchMessage {
+	nowMs := time.Now().UnixMilli()
 	values := make([]BatchPoint, len(points))
 	for i, p := range points {
 		values[i] = BatchPoint{
 			ID: stripNamespace(p.NodeID),
 			V:  p.Value,
 			Q:  p.Quality == "Good",
-			T:  p.Timestamp.UnixMilli(),
+			T:  nowMs,
 		}
 	}
 	return BatchMessage{
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: nowMs,
 		Values:    values,
 	}
 }
