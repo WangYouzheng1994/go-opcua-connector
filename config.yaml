@@ -53,6 +53,7 @@ collector:
   push_mode: timed
   push_interval_sec: 1
   force_heartbeat: true
+  filter_bad_quality: true
   subscription_nodes:
     - ns=2;s=t1.d1.*
 

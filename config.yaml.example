@@ -321,6 +321,18 @@ collector:
   #   - 只关心变化数据 → false
   force_heartbeat: true
 
+  # 过滤非Good质量数据点
+  # 类型：布尔
+  # 默认值：false
+  # 说明：开启后不再推送 Quality 不为 "Good" 的数据点（即时模式和定时模式均生效）
+  # 用途：
+  #   - true：只推送质量正常的数据，下游收到的 q 字段始终为 true
+  #   - false：推送所有数据点（含 Uncertain、Bad、Stale等），保持向后兼容
+  # 建议：
+  #   - 下游只关心有效数据 → true
+  #   - 需要监控数据质量变化 → false
+  filter_bad_quality: false
+
   # OPC UA节点ID列表
   # 类型：数组，每个元素为字符串
   # 默认值：无

@@ -258,6 +258,9 @@ func (c *Collector) handleDataPoint(point *model.DataPoint) {
 		return
 	}
 
+	// 即时模式下，过滤 Quality 不为 Good 的数据点（不推送，但仍更新内存池）
+	skipImmediatePush := c.config.FilterBadQuality && point.Quality != "Good"
+
 	c.nodeStatesMu.Lock()
 
 	state, exists := c.nodeStates[point.NodeID]
@@ -285,8 +288,8 @@ func (c *Collector) handleDataPoint(point *model.DataPoint) {
 	}
 
 	// timed 模式：定时器会推送全量数据
-	// immediate 模式：立即发送当前数据点
-	if c.config.PushMode == config.PushModeImmediate {
+	// immediate 模式：立即发送当前数据点（FilterBadQuality 开启时跳过非 Good 点）
+	if c.config.PushMode == config.PushModeImmediate && !skipImmediatePush {
 		pointCopy := *point
 		c.nodeStatesMu.Unlock()
 		// 非阻塞发送，防止 OPC UA 回调线程被阻塞
@@ -522,6 +525,10 @@ func (c *Collector) pushDirtyNodes() {
 
 	for _, state := range c.nodeStates {
 		if strings.HasPrefix(state.Quality, "Bad") && state.Value == nil {
+			continue
+		}
+		// 过滤 Quality 不为 Good 的数据点
+		if c.config.FilterBadQuality && state.Quality != "Good" {
 			continue
 		}
 		// 无论 Dirty 是否为 true，都推送全量数据

@@ -106,6 +106,8 @@ type CollectorConfig struct {
 	PushIntervalSec int `mapstructure:"push_interval_sec"`
 	// ForceHeartbeat 即时模式下是否强制心跳推送，默认true
 	ForceHeartbeat bool `mapstructure:"force_heartbeat"`
+	// FilterBadQuality 是否过滤 Quality 不为 Good 的数据点，默认 false
+	FilterBadQuality bool `mapstructure:"filter_bad_quality"`
 }
 
 // WritebackConfig 回写配置
