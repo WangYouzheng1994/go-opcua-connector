@@ -1,4 +1,4 @@
-// Package opcua provides OPC UA client management including connection, subscription, and data reading.
+// Package opcua provides OPC UA connection, acquisition adapter, and writeback support.
 package opcua
 
 import (
@@ -9,21 +9,20 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"go-opcua-connector/internal/config"
-	"go-opcua-connector/internal/model"
 
 	"github.com/gopcua/opcua"
-	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
 	"go.uber.org/zap"
 )
 
-// Client OPC UA客户端管理器，负责与OPC UA服务器的连接、订阅管理
+// Client OPC UA客户端管理器，负责连接、协议侧采集资源和写回。
 type Client struct {
 	// config OPC UA配置
 	config *config.OPCUAConfig
@@ -33,30 +32,149 @@ type Client struct {
 	logger *zap.Logger
 	// mu 读写锁，保护连接状态和客户端实例
 	mu sync.RWMutex
-}
-
-// DataChangeHandler 回调函数类型，用于处理数据变化
-type DataChangeHandler func(points []model.DataPoint)
-
-// qualityString 将StatusCode映射为简洁的品质字符串
-// OPC UA规范：Good=0x00, Uncertain=0x40, Bad=0x80
-func qualityString(status ua.StatusCode) string {
-	switch status & 0xC0000000 {
-	case 0x00000000:
-		return "Good"
-	case 0x40000000:
-		return "Uncertain"
-	default:
-		return "Bad"
-	}
+	// identityMu 保护 PointID 与 SourceRef 的双向索引
+	identityMu sync.RWMutex
+	// sourceByPointID 仅供 OPC UA Adapter 内部协议操作使用
+	sourceByPointID map[string]SourceRef
+	// pointIDBySource 用于发现去重和协议通知反查
+	pointIDBySource map[string]string
+	// browsePathByPointID 保存生成 PointID 时使用的完整 BrowsePath
+	browsePathByPointID map[string][]string
+	// adapterBackend 允许 Task 3 的协议操作使用可测试后端；生产环境为空时使用 client。
+	adapterBackend acquisitionBackend
+	// handleMu 保护当前连接内单调递增的 ClientHandle。
+	handleMu         sync.Mutex
+	nextClientHandle uint64
+	// adapterNow 为订阅接收时间和主动读取完成时间提供时钟。
+	adapterNow func() time.Time
 }
 
 // NewClient 创建新的OPC UA客户端
 func NewClient(cfg *config.OPCUAConfig, logger *zap.Logger) *Client {
 	return &Client{
-		config: cfg,
-		logger: logger,
+		config:              cfg,
+		logger:              logger,
+		sourceByPointID:     make(map[string]SourceRef),
+		pointIDBySource:     make(map[string]string),
+		browsePathByPointID: make(map[string][]string),
+		nextClientHandle:    1,
+		adapterNow:          time.Now,
 	}
+}
+
+// DiscoverPoints 根据 OPC UA BrowsePath 生成稳定 PointID，并原子替换协议侧身份映射。
+func (c *Client) DiscoverPoints(ctx context.Context, configuredNodes []string) (PointDiscoveryResult, error) {
+	return c.discoverPoints(ctx, configuredNodes, false)
+}
+
+// DiscoverAdditionalPoints 只浏览此前失败的配置项，并把成功结果合并到现有身份映射。
+func (c *Client) DiscoverAdditionalPoints(ctx context.Context, configuredNodes []string) (PointDiscoveryResult, error) {
+	return c.discoverPoints(ctx, configuredNodes, true)
+}
+
+func (c *Client) discoverPoints(ctx context.Context, configuredNodes []string, mergeExisting bool) (PointDiscoveryResult, error) {
+	c.mu.RLock()
+	client := c.client
+	c.mu.RUnlock()
+	if client == nil {
+		return PointDiscoveryResult{}, fmt.Errorf("client not connected")
+	}
+
+	overrides := make([]pointIDOverride, 0, len(c.config.PointIDOverrides))
+	for _, override := range c.config.PointIDOverrides {
+		overrides = append(overrides, pointIDOverride{sourceRef: override.SourceRef, pointID: override.PointID})
+	}
+	discoverer, err := newPointDiscoverer(&opcuaBrowseService{client: client}, overrides)
+	if err != nil {
+		return PointDiscoveryResult{}, err
+	}
+	result, registry := discoverer.discover(ctx, configuredNodes)
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
+	if mergeExisting {
+		registry, result = c.mergePointRegistry(registry, result)
+	}
+
+	c.installPointRegistry(registry)
+	return result, nil
+}
+
+func (c *Client) mergePointRegistry(addition pointRegistry, result PointDiscoveryResult) (pointRegistry, PointDiscoveryResult) {
+	c.identityMu.RLock()
+	merged := pointRegistry{
+		sourceByPointID:     make(map[string]SourceRef, len(c.sourceByPointID)+len(addition.sourceByPointID)),
+		pointIDBySource:     make(map[string]string, len(c.pointIDBySource)+len(addition.pointIDBySource)),
+		browsePathByPointID: make(map[string][]string, len(c.browsePathByPointID)+len(addition.browsePathByPointID)),
+	}
+	for pointID, sourceRef := range c.sourceByPointID {
+		merged.sourceByPointID[pointID] = sourceRef
+	}
+	for sourceRef, pointID := range c.pointIDBySource {
+		merged.pointIDBySource[sourceRef] = pointID
+	}
+	for pointID, browsePath := range c.browsePathByPointID {
+		merged.browsePathByPointID[pointID] = append([]string(nil), browsePath...)
+	}
+	c.identityMu.RUnlock()
+
+	accepted := make([]DiscoveredPoint, 0, len(result.Points))
+	for _, point := range result.Points {
+		pointID := point.PointID
+		sourceRef, exists := addition.sourceByPointID[pointID]
+		if !exists {
+			continue
+		}
+		if existingSource, exists := merged.sourceByPointID[pointID]; exists && existingSource.String() != sourceRef.String() {
+			result.Issues = append(result.Issues, DiscoveryIssue{Source: sourceRef.String(), Reason: "PointID conflicts with an existing SourceRef"})
+			continue
+		}
+		if existingPointID, exists := merged.pointIDBySource[sourceRef.String()]; exists && existingPointID != pointID {
+			result.Issues = append(result.Issues, DiscoveryIssue{Source: sourceRef.String(), Reason: "SourceRef conflicts with an existing PointID"})
+			continue
+		}
+		merged.sourceByPointID[pointID] = sourceRef
+		merged.pointIDBySource[sourceRef.String()] = pointID
+		merged.browsePathByPointID[pointID] = append([]string(nil), addition.browsePathByPointID[pointID]...)
+		accepted = append(accepted, point)
+	}
+	result.Points = accepted
+	sort.Slice(result.Issues, func(i, j int) bool {
+		if result.Issues[i].Source == result.Issues[j].Source {
+			return result.Issues[i].Reason < result.Issues[j].Reason
+		}
+		return result.Issues[i].Source < result.Issues[j].Source
+	})
+	return merged, result
+}
+
+func (c *Client) installPointRegistry(registry pointRegistry) {
+	c.identityMu.Lock()
+	c.sourceByPointID = registry.sourceByPointID
+	c.pointIDBySource = registry.pointIDBySource
+	c.browsePathByPointID = registry.browsePathByPointID
+	c.identityMu.Unlock()
+}
+
+func (c *Client) resolveSourceRef(pointID string) (SourceRef, bool) {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	sourceRef, ok := c.sourceByPointID[pointID]
+	return sourceRef, ok
+}
+
+func (c *Client) resolvePointID(sourceRef SourceRef) (string, bool) {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	pointID, ok := c.pointIDBySource[sourceRef.String()]
+	return pointID, ok
+}
+
+func (c *Client) resolveBrowsePath(pointID string) ([]string, bool) {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	path, ok := c.browsePathByPointID[pointID]
+	return append([]string(nil), path...), ok
 }
 
 // Connect 连接到OPC UA服务器，包含端点发现、安全协商、会话建立。1
@@ -139,174 +257,10 @@ func (c *Client) Connect(ctx context.Context) error {
 		c.client = nil
 		return fmt.Errorf("failed to connect: %w", err)
 	}
+	c.resetClientHandles()
 
 	c.logger.Info("Connected to OPC UA server", zap.String("endpoint", endpoint))
 	return nil
-}
-
-// Subscribe 创建订阅并注册监控项。
-// 节点数>5000时自动拆分为多个Subscription分摊KepServer内部负载。
-func (c *Client) Subscribe(ctx context.Context, nodes []string, topic string, handler DataChangeHandler) error {
-	c.mu.RLock()
-	cli := c.client
-	c.mu.RUnlock()
-
-	if cli == nil {
-		return fmt.Errorf("client not connected, call Connect() first")
-	}
-
-	// 预先构建所有MonitoredItem，ClientHandle 为全局节点索引
-	monitorItems := make([]*ua.MonitoredItemCreateRequest, len(nodes))
-	for i, node := range nodes {
-		nodeID, err := ua.ParseNodeID(node)
-		if err != nil {
-			return fmt.Errorf("invalid node ID %s: %w", node, err)
-		}
-		monitorItems[i] = opcua.NewMonitoredItemCreateRequestWithDefaults(nodeID, ua.AttributeIDValue, uint32(i))
-	}
-
-	// 每个 Subscription 最多挂载 2000 个 MonitoredItem，
-	// 一次 Monitor 搞定，不内层分批。
-	const itemsPerSub = 2000
-	subCount := (len(monitorItems) + itemsPerSub - 1) / itemsPerSub
-	batchTimeout := time.Duration(c.config.RequestTimeout) * time.Second
-
-	// mergedCh 汇总所有 Subscription 的通知，统一由 handleNotifications 消费
-	mergedCh := make(chan *opcua.PublishNotificationData, 1000)
-
-	c.logger.Info("Registering monitored items with multiple subscriptions",
-		zap.Int("total_items", len(monitorItems)),
-		zap.Int("items_per_sub", itemsPerSub),
-		zap.Int("sub_count", subCount),
-		zap.Duration("timeout_per_batch", batchTimeout))
-
-	for subIdx := 0; subIdx < subCount; subIdx++ {
-		subStart := subIdx * itemsPerSub
-		subEnd := subStart + itemsPerSub
-		if subEnd > len(monitorItems) {
-			subEnd = len(monitorItems)
-		}
-		itemsInSub := monitorItems[subStart:subEnd]
-
-		subCh := make(chan *opcua.PublishNotificationData, 100)
-		sub, err := cli.Subscribe(ctx, &opcua.SubscriptionParameters{
-			Interval: 100,
-		}, subCh)
-		if err != nil {
-			return fmt.Errorf("failed to create subscription %d/%d: %w", subIdx+1, subCount, err)
-		}
-
-		// 将该 Subscription 的通知转到汇总通道
-		go func(ch chan *opcua.PublishNotificationData) {
-			for n := range ch {
-				mergedCh <- n
-			}
-		}(subCh)
-
-		c.logger.Info("Creating monitored items for subscription",
-			zap.Int("sub", subIdx+1),
-			zap.Int("sub_count", subCount),
-			zap.Int("items", len(itemsInSub)))
-
-		batchCtx, batchCancel := context.WithTimeout(ctx, batchTimeout)
-		start := time.Now()
-		_, err = sub.Monitor(batchCtx, ua.TimestampsToReturnBoth, itemsInSub...)
-		elapsed := time.Since(start)
-		batchCancel()
-
-		if err != nil {
-			c.logger.Error("Failed to create monitored items for subscription",
-				zap.Int("sub", subIdx+1),
-				zap.Int("sub_count", subCount),
-				zap.Int("items", len(itemsInSub)),
-				zap.Duration("elapsed", elapsed),
-				zap.Error(err))
-			return fmt.Errorf("failed to create monitored items (sub %d/%d): %w", subIdx+1, subCount, err)
-		}
-
-		c.logger.Info("Monitored items created",
-			zap.Int("sub", subIdx+1),
-			zap.Int("sub_count", subCount),
-			zap.Int("items", len(itemsInSub)),
-			zap.Duration("elapsed", elapsed))
-
-		c.logger.Info("Subscription registered",
-			zap.Int("sub", subIdx+1),
-			zap.Int("sub_count", subCount),
-			zap.Int("items", len(itemsInSub)),
-			zap.Uint32("subscription_id", sub.SubscriptionID))
-	}
-
-	go c.handleNotifications(mergedCh, topic, handler, nodes)
-
-	c.logger.Info("All subscriptions created",
-		zap.Int("node_count", len(nodes)),
-		zap.Int("sub_count", subCount))
-
-	return nil
-}
-
-// handleNotifications 处理OPC UA订阅通知数据
-// 解析DataChangeNotification，通过ClientHandle映射回NodeID
-func (c *Client) handleNotifications(
-	notificationCh chan *opcua.PublishNotificationData,
-	topic string,
-	handler DataChangeHandler,
-	nodes []string,
-) {
-	for {
-		select {
-		case notification, ok := <-notificationCh:
-			if !ok {
-				return
-			}
-
-			if notification.Error != nil {
-				c.logger.Error("Publish error", zap.Error(notification.Error))
-				continue
-			}
-
-			if notification.Value == nil {
-				continue
-			}
-
-			data, ok := notification.Value.(*ua.DataChangeNotification)
-			if !ok {
-				continue
-			}
-
-			points := make([]model.DataPoint, 0, len(data.MonitoredItems))
-			for _, item := range data.MonitoredItems {
-				nodeID := "unknown"
-				if int(item.ClientHandle) < len(nodes) {
-					nodeID = nodes[item.ClientHandle]
-				}
-
-				dp := model.DataPoint{
-					NodeID: nodeID,
-				}
-
-				if item.Value != nil {
-					if item.Value.Value != nil {
-						dp.Value = item.Value.Value.Value()
-					}
-					dp.Quality = qualityString(item.Value.Status)
-					if !item.Value.ServerTimestamp.IsZero() {
-						dp.Timestamp = item.Value.ServerTimestamp
-					}
-				} else {
-					dp.Quality = "BadNoValue"
-					dp.Timestamp = time.Now()
-				}
-
-				points = append(points, dp)
-			}
-
-			if len(points) > 0 {
-				handler(points)
-			}
-		}
-	}
 }
 
 // Close 关闭客户端连接，不在持锁期间执行网络I/O。
@@ -396,258 +350,18 @@ func loadPrivateKeyFile(filename string) (*rsa.PrivateKey, error) {
 
 // IsConnected 检查连接状态
 func (c *Client) IsConnected() bool {
+	return c.ConnectionState() == opcua.Connected
+}
+
+// ConnectionState 返回底层 gopcua 客户端的真实连接状态。
+func (c *Client) ConnectionState() opcua.ConnState {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.client != nil
-}
-
-// ResolveNodes 解析配置节点列表，自动展开文件夹节点为叶子变量节点
-// 对每个配置节点尝试Browse子节点：
-// - 无Variable子节点 → 视为叶子节点，直接保留
-// - 有Variable子节点（精确模式） → 展开为直接子节点列表
-// - 有Variable子节点（通配模式.*） → 穿透Object子文件夹，递归收集所有叶子
-func (c *Client) ResolveNodes(ctx context.Context, nodeIDs []string) ([]string, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	if c.client == nil {
-		return nil, fmt.Errorf("client not connected")
-	}
-
-	resolved := make([]string, 0, len(nodeIDs))
-
-	for _, rawNodeID := range nodeIDs {
-		recursive := false
-		cleanNodeID := rawNodeID
-
-		// 检测.*通配符后缀，决定是否递归穿透Object文件夹
-		if strings.HasSuffix(rawNodeID, ".*") {
-			recursive = true
-			cleanNodeID = rawNodeID[:len(rawNodeID)-2]
-		}
-
-		id, err := ua.ParseNodeID(cleanNodeID)
-		if err != nil {
-			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", rawNodeID), zap.Error(err))
-			continue
-		}
-
-		var leaves []string
-		if recursive {
-			leaves, err = c.browseAllLeaves(ctx, id)
-		} else {
-			leaves, err = c.browseVariableLeaves(ctx, id)
-		}
-
-		if err != nil {
-			c.logger.Warn("Failed to browse node, using as-is",
-				zap.String("node_id", rawNodeID), zap.Error(err))
-			resolved = append(resolved, cleanNodeID)
-			continue
-		}
-
-		if len(leaves) == 0 {
-			resolved = append(resolved, cleanNodeID)
-		} else {
-			c.logger.Info("Node expanded to leaf variables",
-				zap.String("folder_node", rawNodeID),
-				zap.Bool("recursive", recursive),
-				zap.Int("leaf_count", len(leaves)))
-			resolved = append(resolved, leaves...)
-		}
-	}
-
-	return resolved, nil
-}
-
-// browseVariableLeaves 浏览节点的直接Variable子节点，仅取当前层级，仅 HasComponent 引用类型（排除 HasProperty 的元数据属性节点）
-func (c *Client) browseVariableLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
-	node := c.client.Node(nodeID)
-
-	refs, err := node.References(ctx, id.HasComponent, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
-	if err != nil {
-		return nil, err
-	}
-
-	leaves := make([]string, 0, len(refs))
-	for _, ref := range refs {
-		if strings.HasPrefix(ref.BrowseName.Name, "_") {
-			continue
-		}
-		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
-		if childNode == nil || childNode.ID == nil {
-			continue
-		}
-		leaves = append(leaves, childNode.ID.String())
-	}
-
-	return leaves, nil
-}
-
-// browseAllLeaves 递归浏览节点及其所有Object子文件夹，收集所有叶子Variable类型节点的NodeID
-// 跳过_开头的KepServer元数据节点
-func (c *Client) browseAllLeaves(ctx context.Context, nodeID *ua.NodeID) ([]string, error) {
-	node := c.client.Node(nodeID)
-
-	// 收集当前层级的Variable子节点，仅 HasComponent 引用类型（排除 HasProperty 的元数据属性节点）
-	varRefs, err := node.References(ctx, id.HasComponent, ua.BrowseDirectionForward, ua.NodeClassVariable, true)
-	if err != nil {
-		return nil, err
-	}
-
-	leaves := make([]string, 0)
-	for _, ref := range varRefs {
-		// 额外兜底：过滤 _ 开头的 BrowseName（部分非标准 Server 可能不用 HasProperty）
-		if strings.HasPrefix(ref.BrowseName.Name, "_") {
-			continue
-		}
-		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
-		if childNode == nil || childNode.ID == nil {
-			continue
-		}
-		leaves = append(leaves, childNode.ID.String())
-	}
-
-	// 递归进入Object子文件夹，跳过_开头的KepServer元数据节点
-	objRefs, err := node.References(ctx, id.Organizes, ua.BrowseDirectionForward, ua.NodeClassObject, true)
-	if err != nil {
-		return leaves, nil
-	}
-
-	for _, ref := range objRefs {
-		if strings.HasPrefix(ref.BrowseName.Name, "_") {
-			continue
-		}
-		childNode := c.client.NodeFromExpandedNodeID(ref.NodeID)
-		if childNode == nil || childNode.ID == nil {
-			continue
-		}
-		childLeaves, err := c.browseAllLeaves(ctx, childNode.ID)
-		if err != nil {
-			c.logger.Warn("Failed to browse child folder, skipping",
-				zap.String("node_id", childNode.ID.String()),
-				zap.Error(err))
-			continue
-		}
-		leaves = append(leaves, childLeaves...)
-	}
-
-	return leaves, nil
-}
-
-// Read 读取单个节点的值（主动拉取）
-func (c *Client) Read(ctx context.Context, nodeID string) (*model.DataPoint, error) {
-	c.mu.RLock()
-	cli := c.client
+	client := c.client
 	c.mu.RUnlock()
-
-	if cli == nil {
-		return nil, fmt.Errorf("client not connected")
+	if client == nil {
+		return opcua.Closed
 	}
-
-	id, err := ua.ParseNodeID(nodeID)
-	if err != nil {
-		return nil, fmt.Errorf("invalid node ID: %w", err)
-	}
-
-	req := &ua.ReadRequest{
-		NodesToRead: []*ua.ReadValueID{
-			{
-				NodeID:       id,
-				AttributeID:  ua.AttributeIDValue,
-				IndexRange:   "",
-				DataEncoding: nil,
-			},
-		},
-		TimestampsToReturn: ua.TimestampsToReturnBoth,
-	}
-
-	resp, err := cli.Read(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("read failed: %w", err)
-	}
-
-	if resp.Results == nil || len(resp.Results) == 0 {
-		return nil, fmt.Errorf("no results returned")
-	}
-
-	result := resp.Results[0]
-	point := &model.DataPoint{
-		NodeID:    nodeID,
-		Quality:   qualityString(result.Status),
-		Timestamp: result.ServerTimestamp,
-	}
-	if result.Value != nil {
-		point.Value = result.Value.Value()
-	}
-
-	return point, nil
-}
-
-// ReadAll 批量读取多个节点的值（主动拉取，用于心跳验证）
-func (c *Client) ReadAll(ctx context.Context, nodeIDs []string) ([]model.DataPoint, error) {
-	c.mu.RLock()
-	cli := c.client
-	c.mu.RUnlock()
-
-	if cli == nil {
-		return nil, fmt.Errorf("client not connected")
-	}
-
-	if len(nodeIDs) == 0 {
-		return nil, nil
-	}
-
-	nodesToRead := make([]*ua.ReadValueID, 0, len(nodeIDs))
-	validNodeIDs := make([]string, 0, len(nodeIDs))
-	for _, nodeID := range nodeIDs {
-		id, err := ua.ParseNodeID(nodeID)
-		if err != nil {
-			c.logger.Warn("Invalid node ID, skipping", zap.String("node_id", nodeID), zap.Error(err))
-			continue
-		}
-		nodesToRead = append(nodesToRead, &ua.ReadValueID{
-			NodeID:       id,
-			AttributeID:  ua.AttributeIDValue,
-			IndexRange:   "",
-			DataEncoding: nil,
-		})
-		validNodeIDs = append(validNodeIDs, nodeID)
-	}
-
-	if len(nodesToRead) == 0 {
-		return nil, nil
-	}
-
-	req := &ua.ReadRequest{
-		NodesToRead:        nodesToRead,
-		TimestampsToReturn: ua.TimestampsToReturnBoth,
-	}
-
-	resp, err := cli.Read(ctx, req)
-	if err != nil {
-		return nil, fmt.Errorf("read failed: %w", err)
-	}
-
-	points := make([]model.DataPoint, 0, len(validNodeIDs))
-	for i, nodeID := range validNodeIDs {
-		if i >= len(resp.Results) {
-			break
-		}
-
-		result := resp.Results[i]
-		point := model.DataPoint{
-			NodeID:    nodeID,
-			Quality:   qualityString(result.Status),
-			Timestamp: result.ServerTimestamp,
-		}
-		if result.Value != nil {
-			point.Value = result.Value.Value()
-		}
-		points = append(points, point)
-	}
-
-	return points, nil
+	return client.State()
 }
 
 // Write 向OPC UA服务器单个节点写入值

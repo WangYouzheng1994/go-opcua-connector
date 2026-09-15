@@ -1,20 +1,25 @@
 /*
-Package collector 实现数据采集引擎，采用订阅+拉取复合模式确保 OPC UA 数据的可靠采集。
+Package collector 实现协议无关的数据采集、状态管理和发送适配。
 
-架构分工：
-  - ResolveNodes:      将配置的文件夹节点展开为叶子变量列表
-  - Subscribe:         从 OPC UA 接收实时数据变化通知
-  - subWorker:         将订阅数据分发到发布通道
-  - heartbeatWorker:   定期拉取所有节点用于停滞检测
-  - staleCheckWorker:  检测长时间未更新的节点，发出 "Stale" 品质
-  - publishWorker:     批量缓存数据点并发布到 NATS
+生产数据流：
 
-数据流：
-  OPC UA 订阅 -> subCh -> subWorker -> pubCh -> publishWorker -> NATS
-              \-> heartbeatWorker (ReadAll) -> 更新 LastUpdate
+	SourceAdapter.Discover
+	  -> StateStore.Initialize
+	  -> Subscription / Initial Verification
+	  -> StateStore
+	  -> immediate 变化快照或 timed 全量快照
+	  -> Publisher
 
-停滞检测：
-  当节点最后更新时间超过 stale_threshold_sec 时，
-  向 NATS 发送一条 Quality="Stale" 的数据点。
+订阅是运行期 Value 的唯一更新来源。主动读取只负责初值播种、可信度验证和
+静态值确认。ConnectionGeneration 隔离连接生命周期，MonitorGeneration 隔离
+单点监控生命周期。
+
+点位发现失败按 Source 和 Reason 输出诊断；空点表导致启动或恢复失败时，返回错误也保留发现原因。
+统计日志区分当前状态池点位数、完整健康状态分布、累计成功发布数和累计发布失败数。
+连接监督在源连接首次不可用、开始完整恢复和恢复成功时记录连接代次与点位数量；恢复失败记录原因和重试间隔。
+
+Collector 只把 PointSnapshot 转换为现有 model.DataPoint 发送契约，不保存 OPC UA
+NodeID、BrowsePath 或 StatusCode。即时模式消费 StateStore 的合并变化信号，定时
+模式按周期读取当前全量快照；两种模式都在质量过滤后按 BatchSize 分批发布。
 */
 package collector

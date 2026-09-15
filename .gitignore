@@ -1,0 +1,43 @@
+# Go 编译产物
+/go-opcua-connector
+*.exe
+*.exe~
+*.test
+/bin/
+/dist/
+
+# 本地依赖副本与 Go 工作区配置
+/vendor/
+/go.work
+/go.work.sum
+
+# 日志、测试覆盖率与性能分析产物
+/logs/
+*.log
+/coverage.out
+/coverage.html
+*.prof
+*.pprof
+/heap*.pb.gz
+
+# 本地运行配置与证书（配置模板保留在版本控制中）
+/config.yaml
+/certs/
+.env
+.env.*
+!.env.example
+
+# IDE 与 AI 工具的本地辅助文件
+/.idea/
+/.vscode/
+/.cursor/
+/.trae/
+/.codex/
+
+# 操作系统与编辑器临时文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

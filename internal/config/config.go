@@ -1,7 +1,10 @@
 // Package config provides application configuration types, loading from YAML files with environment variable overrides.
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // OutputType 输出目标类型
 type OutputType string
@@ -12,6 +15,12 @@ const (
 	// OutputTypeMQTT 推送到MQTT
 	OutputTypeMQTT OutputType = "mqtt"
 )
+
+// OPCUAPointIDOverride 为一个完整 NodeID 显式指定协议无关 PointID。
+type OPCUAPointIDOverride struct {
+	SourceRef string `mapstructure:"source_ref"`
+	PointID   string `mapstructure:"point_id"`
+}
 
 // OPCUAConfig OPC UA服务器配置
 type OPCUAConfig struct {
@@ -31,6 +40,8 @@ type OPCUAConfig struct {
 	SecurityMode string `mapstructure:"security_mode"`
 	// RequestTimeout 请求超时时间，单位秒，默认30
 	RequestTimeout int `mapstructure:"request_timeout"`
+	// PointIDOverrides 显式覆盖 BrowsePath 生成的 PointID
+	PointIDOverrides []OPCUAPointIDOverride `mapstructure:"point_id_overrides"`
 }
 
 // NATSConfig NATS配置
@@ -53,7 +64,7 @@ type PushModeType string
 const (
 	// PushModeImmediate 即时推送：每次变化立即推送，同时支持心跳强制推送
 	PushModeImmediate PushModeType = "immediate"
-	// PushModeTimed 定时推送：累积变化，定时批量推送全量快照
+	// PushModeTimed 定时推送：定时批量推送当前全量快照
 	PushModeTimed PushModeType = "timed"
 )
 
@@ -82,11 +93,11 @@ type MQTTConfig struct {
 type CollectorConfig struct {
 	// OutputType 输出目标类型：nats / mqtt，默认 nats
 	OutputType OutputType `mapstructure:"output_type"`
-	// WorkerCount 并发worker数量，默认10
+	// WorkerCount 旧采集链路的并发 worker 数量，当前仅保留配置兼容
 	WorkerCount int `mapstructure:"worker_count"`
 	// BatchSize 每批发布的数据点数量，默认100
 	BatchSize int `mapstructure:"batch_size"`
-	// ChannelBufferSize 内部channel缓冲区大小，默认10000
+	// ChannelBufferSize 旧采集链路的 channel 缓冲区大小，当前仅保留配置兼容
 	ChannelBufferSize int `mapstructure:"channel_buffer_size"`
 	// PublishTimeoutMs 发布超时时间，单位毫秒，默认5000
 	PublishTimeoutMs int `mapstructure:"publish_timeout_ms"`
@@ -100,11 +111,17 @@ type CollectorConfig struct {
 	StaleThresholdSec int `mapstructure:"stale_threshold_sec"`
 	// HeartbeatIntervalSec 心跳验证拉取间隔，单位秒，默认5
 	HeartbeatIntervalSec int `mapstructure:"heartbeat_interval_sec"`
+	// SubscriptionRetryIntervalSec 单点订阅失败重试间隔，单位秒，默认30
+	SubscriptionRetryIntervalSec int `mapstructure:"subscription_retry_interval_sec"`
+	// ReadBatchSize 主动读取的固定批次大小，默认500
+	ReadBatchSize int `mapstructure:"read_batch_size"`
+	// ReadTimeoutSec 每批主动读取的超时时间，单位秒，默认10
+	ReadTimeoutSec int `mapstructure:"read_timeout_sec"`
 	// PushMode 推送模式：immediate（即时推送）或 timed（定时批量推送），默认 timed
 	PushMode PushModeType `mapstructure:"push_mode"`
 	// PushIntervalSec 定时模式下的推送间隔，单位秒，默认1
 	PushIntervalSec int `mapstructure:"push_interval_sec"`
-	// ForceHeartbeat 即时模式下是否强制心跳推送，默认true
+	// ForceHeartbeat 即时模式下是否推送主动验证产生的状态刷新，默认 false
 	ForceHeartbeat bool `mapstructure:"force_heartbeat"`
 	// FilterBadQuality 是否过滤 Quality 不为 Good 的数据点，默认 false
 	FilterBadQuality bool `mapstructure:"filter_bad_quality"`
@@ -154,6 +171,14 @@ func (c *AppConfig) Validate() error {
 	if c.OPCUA.Endpoint == "" {
 		return fmt.Errorf("OPC UA endpoint is required")
 	}
+	for _, override := range c.OPCUA.PointIDOverrides {
+		if strings.TrimSpace(override.SourceRef) == "" {
+			return fmt.Errorf("OPC UA point_id_overrides contains an empty source NodeID")
+		}
+		if strings.TrimSpace(override.PointID) == "" {
+			return fmt.Errorf("OPC UA point_id_overrides for %s contains an empty PointID", override.SourceRef)
+		}
+	}
 
 	if c.PprofPort <= 0 {
 		c.PprofPort = 6060
@@ -197,14 +222,35 @@ func (c *AppConfig) Validate() error {
 	if c.Collector.ChannelBufferSize <= 0 {
 		c.Collector.ChannelBufferSize = 10000
 	}
+	if c.Collector.PublishTimeoutMs <= 0 {
+		c.Collector.PublishTimeoutMs = 5000
+	}
+	if c.Collector.SubscriptionTopic == "" {
+		c.Collector.SubscriptionTopic = "opcua/data"
+	}
+	if c.Collector.MonitorIntervalSec <= 0 {
+		c.Collector.MonitorIntervalSec = 60
+	}
 	if c.Collector.StaleThresholdSec <= 0 {
-		c.Collector.StaleThresholdSec = 10
+		c.Collector.StaleThresholdSec = 30
 	}
 	if c.Collector.HeartbeatIntervalSec <= 0 {
 		c.Collector.HeartbeatIntervalSec = 5
 	}
+	if c.Collector.SubscriptionRetryIntervalSec <= 0 {
+		c.Collector.SubscriptionRetryIntervalSec = 30
+	}
+	if c.Collector.ReadBatchSize <= 0 {
+		c.Collector.ReadBatchSize = 500
+	}
+	if c.Collector.ReadTimeoutSec <= 0 {
+		c.Collector.ReadTimeoutSec = 10
+	}
 	if c.Collector.PushMode == "" {
 		c.Collector.PushMode = PushModeTimed
+	}
+	if c.Collector.PushMode != PushModeImmediate && c.Collector.PushMode != PushModeTimed {
+		return fmt.Errorf("invalid collector push_mode: %s, must be immediate / timed", c.Collector.PushMode)
 	}
 	if c.Collector.PushIntervalSec <= 0 {
 		c.Collector.PushIntervalSec = 1

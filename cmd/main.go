@@ -86,7 +86,8 @@ func main() {
 		wbTransport = mqttClient
 	}
 
-	col := collector.New(&cfg.Collector, opcuaClient, publisher, logger)
+	acquisitionAdapter := opcua.NewAcquisitionAdapter(opcuaClient, cfg.Collector.SubscriptionNodes)
+	col := collector.New(&cfg.Collector, acquisitionAdapter, publisher, logger)
 	if err := col.Start(); err != nil {
 		logger.Fatal("Failed to start collector", zap.Error(err))
 	}

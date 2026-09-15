@@ -9,6 +9,7 @@ import (
 
 // DataPoint OPC UA数据点模型
 type DataPoint struct {
+	// NodeID 是历史字段名；采集发送链路中保存协议无关 PointID，不保存 OPC UA NodeID。
 	NodeID    string    `json:"node_id"`
 	Value     any       `json:"value"`
 	Quality   string    `json:"quality"`
@@ -35,7 +36,7 @@ func NewBatchMessage(points []DataPoint) BatchMessage {
 	values := make([]BatchPoint, len(points))
 	for i, p := range points {
 		values[i] = BatchPoint{
-			ID: stripNamespace(p.NodeID),
+			ID: p.NodeID,
 			V:  p.Value,
 			Q:  p.Quality == "Good",
 			T:  nowMs,
@@ -45,41 +46,6 @@ func NewBatchMessage(points []DataPoint) BatchMessage {
 		Timestamp: nowMs,
 		Values:    values,
 	}
-}
-
-func stripNamespace(nodeID string) string {
-	idx := strings.Index(nodeID, ";s=")
-	if idx >= 0 {
-		return nodeID[idx+3:]
-	}
-	return nodeID
-}
-
-// NATSMessage NATS消息发布结构
-type NATSMessage struct {
-	// Topic NATS主题
-	Topic string `json:"topic"`
-	// DataPoint 数据点内容
-	DataPoint DataPoint `json:"data_point"`
-}
-
-// NodeDataState 节点数据状态（内存池中的统一状态）
-type NodeDataState struct {
-	// NodeID 节点ID
-	NodeID string
-	// Value 当前值
-	Value any
-	// Quality 品质，取值为 Good/Bad/Uncertain/Stale
-	Quality string
-	// Timestamp 最新值的时间戳
-	Timestamp time.Time
-	// Status 节点状态：Online（正常）/ Stale（停滞）/ Error（错误）
-	Status string
-	// DataType OPC UA数据类型：String/Int32/Int64/Float32/Float64/Bool/Double 等
-	// 用于回写时自动类型适配
-	DataType string
-	// Dirty 是否需要推送（仅定时模式使用）
-	Dirty bool
 }
 
 // WriteCommand 回写命令，由外部系统通过消息队列发送
@@ -138,6 +104,24 @@ type WriteResult struct {
 
 // CollectorStats 采集统计信息
 type CollectorStats struct {
+	// CurrentPoints 当前状态池中的点位数
+	CurrentPoints int64 `json:"current_points"`
+	// HealthyPoints 当前健康点位数
+	HealthyPoints int64 `json:"healthy_points"`
+	// UnhealthyPoints 当前非健康点位数
+	UnhealthyPoints int64 `json:"unhealthy_points"`
+	// InitializingPoints 当前初始化中的点位数
+	InitializingPoints int64 `json:"initializing_points"`
+	// SampleInvalidPoints 当前订阅样本无效的点位数
+	SampleInvalidPoints int64 `json:"sample_invalid_points"`
+	// SubscribeFailedPoints 当前订阅失败的点位数
+	SubscribeFailedPoints int64 `json:"subscribe_failed_points"`
+	// VerificationFailedPoints 当前主动验证失败的点位数
+	VerificationFailedPoints int64 `json:"verification_failed_points"`
+	// SubscriptionMismatchPoints 当前订阅值与主动读取值不一致的点位数
+	SubscriptionMismatchPoints int64 `json:"subscription_mismatch_points"`
+	// SourceDisconnectedPoints 当前因数据源断开而失效的点位数
+	SourceDisconnectedPoints int64 `json:"source_disconnected_points"`
 	// TotalPoints 累计采集总数
 	TotalPoints int64 `json:"total_points"`
 	// SuccessCount 成功发布数

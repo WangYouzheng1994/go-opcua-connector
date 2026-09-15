@@ -1,384 +1,243 @@
-# ============================================================
-# go-opcua-connector 配置文件
-# 使用说明：
-#   1. 复制此文件为 config.yaml
-#   2. 根据实际环境修改各项配置
-#   3. 支持通过环境变量覆盖配置（将层级以_连接并大写）
-#      例如：$env:COLLECTOR_PUSH_MODE = "immediate"
-# ============================================================
+# go-opcua-connector 配置示例
+#
+# 使用方法：
+#   1. 在项目根目录执行：Copy-Item config.yaml.example config.yaml
+#   2. 修改下面标为【首次测试必改】的配置。
+#   3. 从项目根目录启动程序。程序读取“当前工作目录”下的 config.yaml，
+#      相对的日志、证书路径也以当前工作目录为基准。
+#   4. config.yaml 已被 .gitignore 忽略，可保存本机账号、密码和证书路径；
+#      请勿把真实凭据写回本示例文件。
+#
+# 首次测试最少需要确认 5 项：
+#   1. opcua.endpoint：OPC UA 服务地址。
+#   2. OPC UA 的账号及安全策略：匿名无安全连接可保持示例值，否则按服务端修改。
+#   3. collector.subscription_nodes：至少填写一个真实存在的 Variable 或 Object NodeID。
+#   4. collector.output_type：选择 nats 或 mqtt。
+#   5. 所选消息中间件的地址、账号和发布主题。
+#
+# 标量配置可以用大写环境变量覆盖，层级之间使用下划线，例如：
+#   $env:OPCUA_ENDPOINT = "opc.tcp://192.168.1.100:49320"
+#   $env:COLLECTOR_OUTPUT_TYPE = "mqtt"
+# subscription_nodes、point_id_overrides 等数组建议直接写在 YAML 中。
 
-# -------------------- 应用基础配置 --------------------
+# 应用名称，只用于日志标识。通常保持默认。
 app_name: go-opcua-connector
-# 应用名称，用于日志标识和进程监控
-# 类型：字符串
-# 默认值：go-opcua-connector
-# 建议：保持默认即可
 
-# pprof性能分析端口
-# 类型：整数
-# 默认值：6060
-# 说明：通过 http://localhost:6060/debug/pprof 访问性能分析界面
+# pprof HTTP 端口。访问 http://localhost:6060/debug/pprof/ 查看性能信息。
+# 当前绑定所有网卡；端口启动失败只记录警告，不影响采集进程继续运行。
 pprof_port: 6060
 
-# -------------------- 日志配置 --------------------
 log:
-  # 日志输出级别
-  # 类型：字符串，可选值 debug / info / warn / error
-  # 默认值：info
-  # 说明：
-  #   - debug：输出详细调试信息，生产环境慎用
-  #   - info：输出常规运行信息（推荐）
-  #   - warn：只输出警告和错误
-  #   - error：只输出错误信息
+  # 日志级别：debug / info / warn / error。
+  # 首次联调可用 debug，稳定运行后建议改回 info。
   level: info
 
-  # 日志文件存放目录
-  # 类型：字符串，相对路径或绝对路径
-  # 默认值：./logs
-  # 说明：程序启动时自动创建目录，日志写入该目录下的 app.log
+  # 日志目录。相对路径以程序启动时的当前工作目录为基准。
   dir: ./logs
 
-  # 日志保留天数
-  # 类型：整数
-  # 默认值：3
-  # 说明：超过此天数的轮转日志文件自动删除
+  # 轮转日志保留天数。小于等于 0 会恢复默认值 3。
   max_age_day: 3
 
-  # 单个日志文件最大大小
-  # 类型：整数，单位MB
-  # 默认值：100
-  # 说明：app.log 超过此大小时自动轮转，旧文件加时间戳保留
+  # 单个日志文件的最大大小，单位 MB。小于等于 0 会恢复默认值 100。
   max_size_mb: 100
 
-
-# -------------------- OPC UA 服务器配置 --------------------
 opcua:
-  # OPC UA 服务器连接地址
-  # 类型：字符串，格式 opc.tcp://host:port
-  # 默认值：无（必填）
-  # 示例：
-  #   - opc.tcp://localhost:49320        （KepServer默认端口）
-  #   - opc.tcp://192.168.1.100:4840     （远程服务器）
+  # 【首次测试必改】OPC UA Endpoint，格式为 opc.tcp://主机:端口。
+  # KepServer 常见示例：opc.tcp://192.168.1.100:49320
   endpoint: opc.tcp://localhost:49320
 
-  # 客户端证书文件路径（用于安全认证）
-  # 类型：字符串，文件路径
-  # 默认值：空（不使用证书）
-  # 说明：使用安全连接时需要提供 X.509 证书
+  # 客户端证书和私钥。仅当两项都非空时才启用证书身份。
+  # 安全连接通常还需要先在 OPC UA 服务端信任该客户端证书。
   certificate: ""
-
-  # 客户端私钥文件路径（用于安全认证）
-  # 类型：字符串，文件路径
-  # 默认值：空（不使用私钥）
-  # 说明：需与证书配对使用
   private_key: ""
 
-  # 用户名（用于用户认证）
-  # 类型：字符串
-  # 默认值：空（匿名连接）
-  # 说明：如果服务器需要认证，填写用户名
+  # 用户身份。当前实现仅当用户名和密码都非空时才启用账号认证；
+  # 两项都为空表示匿名连接。
   username: ""
-
-  # 密码（用于用户认证）
-  # 类型：字符串
-  # 默认值：空（匿名连接）
-  # 说明：与用户名配对使用
   password: ""
 
-  # 安全策略
-  # 类型：字符串，可选值 None / Basic128Rsa15 / Basic256 / Basic256Sha256
-  # 默认值：None
-  # 说明：
-  #   - None：不加密，不签名（测试环境）
-  #   - Basic128Rsa15：128位加密，RSA15签名（兼容性优先）
-  #   - Basic256：256位加密，RSA签名（平衡模式）
-  #   - Basic256Sha256：256位加密，SHA256签名（推荐，安全优先）
+  # 【首次测试确认】安全策略和安全模式必须与服务端暴露的 Endpoint 一致。
+  # 常用策略：None / Basic256Sha256；依赖也支持服务端提供的其他策略。
+  # 常用模式：None / Sign / SignAndEncrypt。
+  # 本地无安全联调可使用 None + None；生产环境按服务端安全要求配置。
+  # 注意：当前实现找不到指定组合时会记录警告，并尝试回退到 None + None，
+  # 因此连接成功后仍应检查日志中的最终 security_policy 和 security_mode。
   security_policy: None
-
-  # 安全模式
-  # 类型：字符串，可选值 None / Sign / SignAndEncrypt
-  # 默认值：None
-  # 说明：
-  #   - None：不签名，不加密
-  #   - Sign：签名但不加密（验证数据完整性）
-  #   - SignAndEncrypt：签名并加密（推荐，完整保护）
   security_mode: None
 
-  # 请求超时时间
-  # 类型：整数，单位秒
-  # 默认值：30
-  # 说明：每个OPC UA请求的超时时间
+  # OPC UA 请求超时，单位秒。用于端点发现、连接和 Adapter 协议请求。
   request_timeout: 30
 
+  # 可选：为完整 OPC UA NodeID 指定稳定、协议无关的 PointID。
+  # source_ref 必须是完整 NodeID；point_id 是上报消息 values[].id 的值。
+  # 未配置覆盖时，PointID 根据完整 BrowsePath 生成，忽略 Objects 根段，
+  # 各段以“.”连接；BrowseName 中原有的“.”会编码成 %2E，“%”编码成 %25。
+  # 同一 SourceRef 经多条 BrowsePath 发现时，显式覆盖也用于裁决身份歧义。
+  point_id_overrides: []
+  # point_id_overrides:
+  #   - source_ref: "ns=2;s=Channel1.Device1.Temperature"
+  #     point_id: "boiler.temperature"
 
-# -------------------- NATS 消息中间件配置 --------------------
-nats:
-  # NATS 服务器地址
-  # 类型：字符串，支持多个服务器（逗号分隔）
-  # 默认值：无（必填）
-  # 示例：
-  #   - nats://localhost:4222
-  #   - nats://192.168.0.69:4222,nats://192.168.0.70:4222
-  urls: nats://localhost:4222
-
-  # 用户名（用于NATS认证）
-  # 类型：字符串
-  # 默认值：空（匿名连接）
-  # 说明：如果NATS服务器启用了认证，填写用户名
-  username: ""
-
-  # 密码（用于NATS认证）
-  # 类型：字符串
-  # 默认值：空（匿名连接）
-  # 说明：与用户名配对使用
-  password: ""
-
-  # 最大重连次数
-  # 类型：整数
-  # 默认值：-1（无限重试）
-  # 说明：
-  #   - -1：无限重连，直到连接成功
-  #   - 0：不重连，连接失败直接报错
-  #   - N>0：最多重连N次后放弃
-  max_reconnects: -1
-
-  # 重连等待时间
-  # 类型：整数，单位毫秒
-  # 默认值：1000
-  # 说明：每次重连失败后，等待多久再尝试
-  reconnect_wait_ms: 1000
-
-
-# -------------------- MQTT 消息中间件配置（output_type=mqtt 时生效） --------------------
-mqtt:
-  # MQTT Broker地址
-  # 类型：字符串，多个用逗号分隔
-  # 示例：tcp://localhost:1883 或 ssl://mqtt.example.com:8883
-  brokers: tcp://localhost:1883
-
-  # 客户端ID（MQTT协议要求唯一，为空自动生成）
-  client_id: ""
-
-  # 用户名/密码（Broker认证，默认空=匿名）
-  username: ""
-  password: ""
-
-  # 发布主题，默认 opcua/data
-  topic: opcua/data
-
-  # 服务质量：0=最多一次 1=至少一次 2=恰好一次，默认0
-  qos: 0
-
-  # 保留消息：新订阅者是否立即收到最新数据，默认false
-  retained: false
-
-  # 清除会话：断开后Broker是否清除未发送消息，默认true
-  clean_session: true
-
-  # 心跳间隔，单位秒，默认60
-  keepalive_sec: 60
-
-  # 连接超时，单位秒，默认10
-  connect_timeout_sec: 10
-
-  # 发布超时，单位秒，默认5
-  publish_timeout_sec: 5
-
-  # 自动重连，默认true
-  auto_reconnect: true
-
-  # 最大重连间隔，单位秒，默认60
-  max_reconnect_delay_sec: 60
-
-  # TLS客户端证书（可选，双向TLS）
-  # tls_cert_file: ""
-  # tls_key_file: ""
-
-  # TLS CA证书（可选，验证Broker证书）
-  # tls_ca_file: ""
-
-  # 跳过TLS证书验证（仅测试环境！）
-  insecure_skip_verify: false
-
-
-# -------------------- 数据采集器配置 --------------------
 collector:
-  # 输出目标类型
-  # 类型：字符串，可选值 nats / mqtt
-  # 默认值：nats
-  # 说明：
-  #   - nats：推送到NATS（默认，向后兼容）
-  #   - mqtt：推送到MQTT
-  # 注意：
-  #   - nats 模式需要配置 nats 节
-  #   - mqtt 模式需要配置 mqtt 节
+  # 【首次测试必改】输出目标：nats 或 mqtt。一次运行只选择一种。
   output_type: nats
-  # 并发Worker数量
-  # 类型：整数
-  # 默认值：10
-  # 说明：处理订阅数据的并发协程数量
-  # 建议：
-  #   - 10万点位：10-20
-  #   - 20万点位：20-30
-  #   - 过多会增加CPU开销，过少处理不及时
-  worker_count: 10
 
-  # 每批发布的数据点数量
-  # 类型：整数
-  # 默认值：100
-  # 说明：攒够此数量的数据点后，批量发布到NATS
-  # 建议：
-  #   - 数值越大，批量效率越高，但延迟增加
-  #   - 数值越小，延迟低，但网络往返开销大
-  batch_size: 100
+  # 【首次测试必改】需要采集的 OPC UA NodeID 列表。实际运行至少要有一个有效点。
+  #
+  # 支持三种发现方式：
+  #   1. Variable NodeID：只采集该点。
+  #   2. Object NodeID，不带 .*：只采集该 Object 的直接 Variable 子节点。
+  #   3. Object NodeID，带 .*：递归进入子 Object，采集所有 Variable 叶子。
+  #
+  # NodeID 常见格式：
+  #   ns=2;s=Channel1.Device1.Temperature   字符串标识
+  #   ns=2;i=1234                           数字标识
+  #
+  # KepServer 示例：
+  #   单点：         ns=2;s=Channel1.Device1.Temperature
+  #   设备直接子点： ns=2;s=Channel1.Device1
+  #   设备递归采集： ns=2;s=Channel1.Device1.*
+  #
+  # 建议首次测试先填 1～5 个确定存在的点，验证成功后再扩大范围。
+  subscription_nodes:
+    - ns=2;s=Channel1.Device1.Temperature
 
-  # 内部Channel缓冲区大小
-  # 类型：整数
-  # 默认值：10000
-  # 说明：订阅数据到发布之间的缓冲队列大小
-  # 建议：
-  #   - 应大于 batch_size * worker_count
-  #   - 防止数据量大时阻塞订阅
-  channel_buffer_size: 10000
-
-  # 发布超时时间
-  # 类型：整数，单位毫秒
-  # 默认值：5000
-  # 说明：批量发布到NATS的超时时间
-  publish_timeout_ms: 5000
-
-  # 订阅数据后发布到的NATS主题
-  # 类型：字符串
-  # 默认值：opcua/data
-  # 说明：下游消费者订阅此主题获取数据
-  subscription_topic: opcua/data
-
-  # 监控统计输出间隔
-  # 类型：整数，单位秒
-  # 默认值：60
-  # 说明：定期输出采集统计信息（日志级别为info时可见）
-  # 设置为0可禁用监控输出
-  monitor_interval_sec: 60
-
-  # 数据停滞判定阈值
-  # 类型：整数，单位秒
-  # 默认值：30
-  # 说明：超过此时间未收到数据更新的节点，标记为Stale
-  # 建议：
-  #   - 应大于 heartbeat_interval_sec，确保心跳验证有机会更新数据
-  #   - 过小会导致频繁Stale误报
-  #   - 过大则无法及时发现数据停滞
-  stale_threshold_sec: 30
-
-  # 健康检查间隔
-  # 类型：整数，单位秒
-  # 默认值：5
-  # 说明：定期主动拉取所有节点数据，验证数据新鲜度
-  # 作用：
-  #   - 补充订阅丢失的数据
-  #   - 验证订阅数据的准确性
-  #   - 防止稳态数据被误判为停滞
-  heartbeat_interval_sec: 5
-
-  # 推送模式
-  # 类型：字符串，可选值 immediate / timed
-  # 默认值：timed
-  # 说明：控制数据推送到NATS的方式
-  #   - immediate（即时模式）：每次变化立即推送
-  #   - timed（定时模式）：累积脏标记，定时批量推送全量快照
-  # 即时模式：
-  #   - 优点：下游实时获取数据
-  #   - 缺点：数据量大时网络开销大
-  # 定时模式：
-  #   - 优点：批量推送效率高，下游获得稳定的数据流
-  #   - 缺点：有延迟，取决于 push_interval_sec
-  # 建议：
-  #   - 下游需要实时数据 → immediate
-  #   - 下游需要稳定批量数据，或数据量大 → timed
+  # 推送模式：
+  #   timed：每隔 push_interval_sec 取得一次当前 StateStore 全量快照并发送。
+  #   immediate：订阅值或健康状态变化后发送合并后的最新变化点。
+  # immediate 关注最新状态，不保证把同一点的每个中间变化都逐条发送。
+  # 首次测试建议 timed，便于持续观察完整点表。
   push_mode: timed
 
-  # 定时推送间隔（仅定时模式有效）
-  # 类型：整数，单位秒
-  # 默认值：1
-  # 说明：定时模式下的推送间隔，每隔此时间推送一次全量快照
-  # 注意：
-  #   - 仅在 push_mode=timed 时生效
-  #   - 应确保 heartbeat_interval_sec < push_interval_sec
-  # 建议：
-  #   - 需要高实时性：push_interval_sec = 1
-  #   - 需要高吞吐量：push_interval_sec = 5~10
+  # timed 模式的全量快照推送间隔，单位秒；immediate 模式不使用。
+  # 点位多时，间隔越短，消息量和序列化开销越大。
   push_interval_sec: 1
 
-  # 心跳强制推送（即时模式有效）
-  # 类型：布尔
-  # 默认值：true
-  # 说明：即时推送模式下，心跳验证成功后是否强制推送当前值
-  # 用途：
-  #   - true：确保下游始终有数据流，即使OPC UA没有变化通知
-  #   - false：只在数据实际变化时推送
-  # 建议：
-  #   - 下游需要稳定数据流 → true
-  #   - 只关心变化数据 → false
-  force_heartbeat: true
+  # 每条上报消息最多包含的数据点数量。
+  # immediate 的合并变化和 timed 的全量快照都会先执行质量过滤，再按此值拆批。
+  # 例如最终有 250 个点、batch_size=100，会发送 100/100/50 三条消息。
+  batch_size: 100
 
-  # 过滤非Good质量数据点
-  # 类型：布尔
-  # 默认值：false
-  # 说明：开启后不再推送 Quality 不为 "Good" 的数据点（即时模式和定时模式均生效）
-  # 用途：
-  #   - true：只推送质量正常的数据，下游收到的 q 字段始终为 true
-  #   - false：推送所有数据点（含 Uncertain、Bad、Stale等），保持向后兼容
-  # 建议：
-  #   - 下游只关心有效数据 → true
-  #   - 需要监控数据质量变化 → false
+  # 每一批发送到 NATS 或 MQTT 的超时，单位毫秒。
+  # 这是当前生产发布链路真正使用的发布超时配置。
+  publish_timeout_ms: 5000
+
+  # 数据发布 Subject/Topic。
+  # NATS 模式直接使用该值；MQTT 模式优先使用 mqtt.topic。
+  subscription_topic: opcua/data
+
+  # 主动验证间隔，单位秒。主动 Read 只确认当前订阅值是否可信，
+  # 不会覆盖更新的订阅 Value；稳定不变化的点也能借此刷新 LastConfirmedAt。
+  heartbeat_interval_sec: 5
+
+  # 超过该时长未被订阅或主动验证确认时，将点标为 Stale，单位秒。
+  # Stale 仍保留最近值。建议明显大于 heartbeat_interval_sec 和 read_timeout_sec，
+  # 避免网络抖动时频繁进入 Stale。
+  stale_threshold_sec: 30
+
+  # 发现失败、订阅失败或确认失配后的重试间隔，单位秒。
+  # 单点失败不会直接终止整个采集器。
+  subscription_retry_interval_sec: 30
+
+  # 初始读取和周期主动验证时，每个 OPC UA Read 请求包含的最大点数。
+  read_batch_size: 500
+
+  # 每个主动读取批次的独立超时，单位秒。
+  read_timeout_sec: 10
+
+  # immediate 模式下，主动验证确认状态时是否也触发发送。
+  # false：主要发送订阅变化和健康状态变化，流量较小。
+  # true：即使值不变，验证成功也可持续向下游发送当前状态。
+  # timed 模式本身会周期发送全量快照，因此该项不影响 timed 的定时发送。
+  force_heartbeat: false
+
+  # 是否在发送前过滤非 Healthy 点。
+  # false：保留异常点并通过消息 q=false 告知下游，适合联调和质量监控。
+  # true：异常、无效或 Stale 点都不发送，但仍保留在 StateStore 中。
   filter_bad_quality: false
 
-  # OPC UA节点ID列表
-  # 类型：数组，每个元素为字符串
-  # 默认值：无
-  # 说明：
-  #   - 支持单个节点：ns=2;s=Channel.Device.Tag
-  #   - 支持文件夹节点（自动展开为所有叶子标签）
-  #   - 支持通配符递归展开
-  #
-  # NodeID格式说明：
-  #   ns=X;s=xxx     - 字符串型（X=命名空间索引）
-  #   ns=X;i=123     - 整数型
-  #   ns=X;g=xxxx    - GUID型
-  #
-  # 对接KepServer示例：
-  #   - 单个标签：ns=2;s=Channel1.Device1.Temperature
-  #   - 设备文件夹（精确模式）：ns=2;s=Channel1.Device1
-  #   - 通配递归（穿透所有标记组）：ns=2;s=Channel1.Device1.*
-  #
-  # 精确模式 vs 通配模式：
-  #   无.*后缀 = 仅取当前层级Variable子节点（不穿透标记组）
-  #   有.*后缀 = 递归穿透所有Object子文件夹，收集全部Variable叶子
-  #   适用场景：
-  #     - KepServer无标记组层级 → 精确模式即可
-  #     - KepServer有Channel.Device.标记组.Tag四级结构 → 用.*通配
-  subscription_nodes:
-    - ns=2;s=t1.d1
+  # 采集统计日志输出间隔，单位秒。
+  # 小于等于 0 会恢复默认值 60，当前不能用 0 关闭统计日志。
+  monitor_interval_sec: 60
 
+  # 【兼容字段】旧 worker/channel 架构已移除，当前 StateStore 采集链路不使用。
+  # 保留它们只为兼容已有配置，不需要为性能测试调整。
+  worker_count: 10
+  channel_buffer_size: 10000
 
-# -------------------- 点位回写配置 --------------------
+nats:
+  # 【output_type=nats 时必改】NATS 地址，多个地址用逗号分隔。
+  urls: nats://localhost:4222
+
+  # 当前实现仅当用户名和密码都非空时才启用账号认证。
+  username: ""
+  password: ""
+
+  # -1：持续重连；0：不重连；正数：最大重连次数。
+  max_reconnects: -1
+
+  # 两次 NATS 重连之间的等待时间，单位毫秒。
+  reconnect_wait_ms: 1000
+
+  # 当前使用 Core NATS Publish，没有 JetStream 持久化和消费确认。
+  # Publish 成功表示客户端已完成发送，不代表下游业务已经处理。
+
+mqtt:
+  # 【output_type=mqtt 时必改】Broker 地址，多个地址用逗号分隔。
+  # 无 TLS 示例：tcp://localhost:1883
+  # TLS 示例：   ssl://mqtt.example.com:8883
+  brokers: tcp://localhost:1883
+
+  # 客户端 ID 必须在 Broker 中唯一；留空时程序自动生成。
+  client_id: ""
+
+  # Broker 账号。是否允许匿名连接取决于 Broker 配置。
+  username: ""
+  password: ""
+
+  # MQTT 数据发布 Topic。MQTT 模式下优先于 collector.subscription_topic。
+  topic: opcua/data
+
+  # MQTT QoS：0=最多一次，1=至少一次，2=恰好一次。
+  # QoS 只描述 MQTT 协议投递级别，不等于下游业务处理确认。
+  qos: 0
+
+  # 是否将每批数据设为 retained message。
+  retained: false
+
+  # true 表示重连时不恢复旧会话；回写命令订阅也使用该客户端连接。
+  clean_session: true
+
+  # MQTT Keep Alive 和首次连接超时，单位秒。
+  keepalive_sec: 60
+  connect_timeout_sec: 10
+
+  # 【兼容字段】当前 PublishBatch 不读取本字段。
+  # 实际生产发送超时由 collector.publish_timeout_ms 控制。
+  publish_timeout_sec: 5
+
+  # MQTT 客户端断线后是否自动重连，以及重连等待上限（秒）。
+  auto_reconnect: true
+  max_reconnect_delay_sec: 60
+
+  # TLS 客户端证书和私钥：仅当两项都非空时加载，用于双向 TLS。
+  tls_cert_file: ""
+  tls_key_file: ""
+
+  # 用于验证 Broker 服务端证书的 CA 文件；普通单向 TLS 通常只需配置它。
+  tls_ca_file: ""
+
+  # 跳过 Broker 证书校验，仅可用于临时联调。
+  insecure_skip_verify: false
+
 writeback:
-  # 接收回写命令的主题
-  # 类型：字符串
-  # 默认值：opcua/write
-  # 说明：外部系统发回写命令到此主题，程序收到后执行OPC UA写操作
-  # 注：主题类型取决于 output_type — nats 模式下为 NATS Subject，mqtt 模式下为 MQTT Topic
-  # 消息格式：
-  #   {"node_id":"ns=2;s=t1.d1.Temperature","value":"25.5","value_type":"float64","request_id":"abc123"}
-  #   value_type 可选：int32 / int64 / float32 / float64 / bool / string
-  #   value_type 为空时自动推断类型
+  # 接收回写命令和发布回写结果的 Subject/Topic。
+  # NATS、MQTT 共用这两个字段，并随 collector.output_type 选择传输。
+  # 当前没有独立的 writeback_enabled 开关，程序会尝试启动回写监听。
   write_subject: opcua/write
-
-  # 发布回写结果的主题
-  # 类型：字符串
-  # 默认值：opcua/write/result
-  # 说明：每次回写操作完成后，发布结果到此主题
-  # 注：主题类型取决于 output_type
-  # 结果格式：
-  #   {"node_id":"ns=2;s=t1.d1.Temperature","success":true,"written_value":25.5,"request_id":"abc123"}
   result_subject: opcua/write/result
+
+  # 首次只测试采集时，不向 write_subject 发送消息即可，不会主动写点。
+  # 如需测试回写，优先使用完整 NodeID，避免短 PointID 在多命名空间中产生歧义：
+  # {"node_id":"ns=2;s=Channel1.Device1.SetPoint","value":"25.5","value_type":"float64","request_id":"test-001"}
+  # value_type 可选：int32 / int64 / float32 / float64 / bool / string；留空时尝试推断。

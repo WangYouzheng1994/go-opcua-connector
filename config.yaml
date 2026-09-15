@@ -15,14 +15,8 @@ opcua:
   password: ""
   security_policy: Basic256
   security_mode: SignAndEncrypt
-  request_timeout: 200
+  request_timeout: 30
 
-nats:
-  urls: nats://192.168.0.69:4222
-  username: ""
-  password: ""
-  max_reconnects: -1
-  reconnect_wait_ms: 1000
 
 mqtt:
   brokers: tcp://192.168.0.61:1883
@@ -30,7 +24,7 @@ mqtt:
   username: ""
   password: ""
   topic: go_opcua/data
-  qos: 0
+  qos: 1
   retained: false
   clean_session: true
   keepalive_sec: 60
@@ -42,20 +36,18 @@ mqtt:
 
 collector:
   output_type: mqtt
-  worker_count: 10
   batch_size: 100
-  channel_buffer_size: 10000
   publish_timeout_ms: 5000
-  subscription_topic: opcua/data
-  monitor_interval_sec: 60
   stale_threshold_sec: 30
   heartbeat_interval_sec: 5
+  subscription_retry_interval_sec: 30
+  read_batch_size: 500
+  read_timeout_sec: 10
   push_mode: timed
   push_interval_sec: 1
-  force_heartbeat: true
-  filter_bad_quality: true
+  filter_bad_quality: false
   subscription_nodes:
-    - ns=2;s=t1.d1.*
+    - ns=2;s=t1.d1
 
 writeback:
   write_subject: opcua/write
