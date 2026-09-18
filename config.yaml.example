@@ -238,6 +238,8 @@ writeback:
   result_subject: opcua/write/result
 
   # 首次只测试采集时，不向 write_subject 发送消息即可，不会主动写点。
-  # 如需测试回写，优先使用完整 NodeID，避免短 PointID 在多命名空间中产生歧义：
-  # {"node_id":"ns=2;s=Channel1.Device1.SetPoint","value":"25.5","value_type":"float64","request_id":"test-001"}
-  # value_type 可选：int32 / int64 / float32 / float64 / bool / string；留空时尝试推断。
+  # 单点和批量统一使用 request_id + items；单点写的 items 长度为 1。
+  # point_id 必须来自 Discovery 建立的 Point Registry，调用方不传 NodeID 或 DataType：
+  # {"request_id":"test-001","items":[{"point_id":"Channel1.Device1.SetPoint","value":25.5}]}
+  # 迁移期临时兼容旧数组格式 [{"id":"Channel1.Device1.SetPoint","v":25.5}]；id 仍按 PointID 解析。
+  # 每个 Request 最终只在 result_subject 发布一条聚合结果。

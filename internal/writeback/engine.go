@@ -5,47 +5,53 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go-opcua-connector/internal/config"
-	"go-opcua-connector/internal/model"
 	"go-opcua-connector/internal/opcua"
 
 	"go.uber.org/zap"
 )
 
-// Engine 回写引擎。
-// 负责：订阅命令 → JSON解析 → 类型转换 → OPC UA写入 → 发布结果。
-// 通过 Transport 接口与消息中间件解耦。
+const (
+	shutdownGracePeriod  = 10 * time.Second
+	resultPublishTimeout = 5 * time.Second
+)
+
+// Engine 负责统一 PointID 请求的订阅、入队、执行结果发布和有限优雅退出。
 type Engine struct {
-	opcuaClient     *opcua.Client
 	transport       Transport
 	logger          *zap.Logger
 	sub             Subscription
 	writeSubject    string
 	resultSubject   string
-	nodeIDPrefix    string
-	nodeDataTypes   map[string]string
-	nodeDataTypesMu sync.RWMutex
+	executor        *QueueExecutor
+	shutdownGrace   time.Duration
+	stopOnce        sync.Once
+	lifecycleMu     sync.RWMutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	publishEnabled  atomic.Bool
 }
 
-// NewEngine 创建回写引擎。
-// nodeIDPrefix 用于还原短节点ID为完整OPC UA节点ID，如 "ns=2;s="。
-func NewEngine(opcuaClient *opcua.Client, transport Transport, cfg *config.WritebackConfig, nodeIDPrefix string, logger *zap.Logger) *Engine {
-	return &Engine{
-		opcuaClient:   opcuaClient,
+// NewEngine 创建以统一 PointID Request 为内部模型的回写引擎。
+func NewEngine(opcuaClient *opcua.Client, transport Transport, cfg *config.WritebackConfig, logger *zap.Logger) *Engine {
+	engine := &Engine{
 		transport:     transport,
 		logger:        logger,
 		writeSubject:  cfg.WriteSubject,
 		resultSubject: cfg.ResultSubject,
-		nodeIDPrefix:  nodeIDPrefix,
-		nodeDataTypes: make(map[string]string),
+		shutdownGrace: shutdownGracePeriod,
+		lifecycleCtx:  context.Background(),
 	}
+	engine.publishEnabled.Store(true)
+	engine.executor = NewQueueExecutor(opcuaClient, engine.publishResult)
+	return engine
 }
 
-// Start 订阅回写命令并开始处理。
+// Start 订阅回写命令并启动唯一 Worker。
 func (e *Engine) Start(ctx context.Context) error {
 	sub, err := e.transport.Subscribe(ctx, e.writeSubject, e.handleMessage)
 	if err != nil {
@@ -53,251 +59,85 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	e.sub = sub
+	runCtx, runCancel := context.WithCancel(ctx)
+	e.lifecycleMu.Lock()
+	e.lifecycleCtx = runCtx
+	e.lifecycleCancel = runCancel
+	e.lifecycleMu.Unlock()
+	go e.executor.Run(runCtx)
 	e.logger.Info("Writeback engine started",
 		zap.String("write_subject", e.writeSubject),
 		zap.String("result_subject", e.resultSubject))
 	return nil
 }
 
-// SetNodeDataTypes 设置节点数据类型缓存，用于自动类型适配。
-func (e *Engine) SetNodeDataTypes(dataTypes map[string]string) {
-	e.nodeDataTypesMu.Lock()
-	defer e.nodeDataTypesMu.Unlock()
-	e.nodeDataTypes = dataTypes
-	e.logger.Info("Node data types cached for writeback",
-		zap.Int("count", len(dataTypes)))
-}
-
-func (e *Engine) getNodeDataType(nodeID string) string {
-	e.nodeDataTypesMu.RLock()
-	defer e.nodeDataTypesMu.RUnlock()
-	if dt, ok := e.nodeDataTypes[nodeID]; ok {
-		return dt
-	}
-	return ""
-}
-
-// Stop 停止回写引擎。
+// Stop 停止接收新请求，并给予当前请求固定的有限优雅退出时间。
 func (e *Engine) Stop() {
-	if e.sub != nil {
-		e.sub.Unsubscribe()
-		e.sub = nil
-	}
-	e.logger.Info("Writeback engine stopped")
-}
-
-// handleMessage 处理回写命令消息，支持新格式 [{"id":"...","v":...}] 和旧格式 {"node_id":"..."}。
-func (e *Engine) handleMessage(data []byte) {
-	var items []model.BatchWriteItem
-	if err := json.Unmarshal(data, &items); err == nil && len(items) > 0 {
-		for _, item := range items {
-			cmd := item.ToWriteCommand(e.nodeIDPrefix)
-			e.processWriteCommand(&cmd)
-		}
-		return
-	}
-
-	var cmd model.WriteCommand
-	if err := json.Unmarshal(data, &cmd); err != nil {
-		e.logger.Error("Failed to parse write command", zap.Error(err))
-		e.publishResult(model.WriteResult{
-			Error: fmt.Sprintf("invalid JSON: %v", err),
-		})
-		return
-	}
-
-	e.processWriteCommand(&cmd)
-}
-
-func (e *Engine) processWriteCommand(cmd *model.WriteCommand) {
-	if cmd.NodeID == "" {
-		e.publishResult(model.WriteResult{
-			RequestID: cmd.RequestID,
-			Error:     "node_id is required",
-		})
-		return
-	}
-
-	metadataType := e.getNodeDataType(cmd.NodeID)
-	userType := cmd.ValueType
-
-	if metadataType == "" {
-		readCtx, readCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer readCancel()
-		dt, err := e.opcuaClient.ReadNodeDataTypes(readCtx, []string{cmd.NodeID})
-		if err != nil {
-			e.logger.Warn("Failed to lazy-read node data type",
-				zap.String("node_id", cmd.NodeID), zap.Error(err))
-		} else if t, ok := dt[cmd.NodeID]; ok && t != "" {
-			metadataType = t
-			e.nodeDataTypesMu.Lock()
-			e.nodeDataTypes[cmd.NodeID] = t
-			e.nodeDataTypesMu.Unlock()
-			e.logger.Debug("Node data type lazy-loaded",
-				zap.String("node_id", cmd.NodeID),
-				zap.String("data_type", t))
-		}
-	}
-
-	var writeValue any
-	convertedType := ""
-	var err error
-
-	if userType != "" {
-		if !isCompatibleTypeGroup(userType, metadataType) {
-			e.logger.Warn("User type may be incompatible with node metadata type",
-				zap.String("node_id", cmd.NodeID),
-				zap.String("user_type", userType),
-				zap.String("metadata_type", metadataType))
-		}
-		writeValue, err = opcua.ConvertWriteValue(cmd.Value, userType)
-		if err != nil {
-			e.logger.Warn("Value conversion with user type failed, retrying with metadata type",
-				zap.String("node_id", cmd.NodeID),
-				zap.String("raw_value", cmd.Value),
-				zap.String("user_type", userType),
-				zap.String("metadata_type", metadataType),
-				zap.Error(err))
-			if metadataType != "" && metadataType != userType {
-				writeValue, err = opcua.ConvertWriteValue(cmd.Value, metadataType)
-				if err != nil {
-					e.logger.Warn("Value conversion with metadata type also failed, using raw string",
-						zap.String("node_id", cmd.NodeID),
-						zap.String("raw_value", cmd.Value),
-						zap.String("metadata_type", metadataType),
-						zap.Error(err))
-					writeValue = cmd.Value
-				} else {
-					convertedType = metadataType
-				}
-			} else {
-				writeValue = cmd.Value
+	e.stopOnce.Do(func() {
+		e.executor.StopAccepting()
+		if e.sub != nil {
+			if err := e.sub.Unsubscribe(); err != nil {
+				e.logger.Warn("Failed to unsubscribe writeback subject", zap.Error(err))
 			}
-		} else {
-			convertedType = userType
+			e.sub = nil
 		}
-	} else if metadataType != "" && metadataType != "String" {
-		writeValue, err = opcua.ConvertWriteValue(cmd.Value, metadataType)
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), e.shutdownGrace)
+		err := e.executor.Shutdown(shutdownCtx)
+		cancel()
 		if err != nil {
-			e.logger.Warn("Value conversion with metadata type failed, using raw string",
-				zap.String("node_id", cmd.NodeID),
-				zap.String("raw_value", cmd.Value),
-				zap.String("metadata_type", metadataType),
+			e.logger.Warn("Writeback shutdown grace period expired",
+				zap.Duration("grace_period", e.shutdownGrace),
 				zap.Error(err))
-			writeValue = cmd.Value
-		} else {
-			convertedType = metadataType
 		}
-	} else {
-		writeValue = cmd.Value
-	}
 
-	e.logger.Info("Write value prepared",
-		zap.String("node_id", cmd.NodeID),
-		zap.String("user_type", userType),
-		zap.String("metadata_type", metadataType),
-		zap.String("converted_type", convertedType),
-		zap.Any("value", writeValue),
-		zap.String("value_kind", fmt.Sprintf("%T", writeValue)))
-
-	writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	writeErr := e.opcuaClient.Write(writeCtx, cmd.NodeID, writeValue)
-	if writeErr != nil {
-		if userType != "" && metadataType != "" && !isCompatibleTypeGroup(userType, metadataType) {
-			e.logger.Warn("Write failed with user type, retrying with metadata type",
-				zap.String("node_id", cmd.NodeID),
-				zap.String("user_type", userType),
-				zap.String("metadata_type", metadataType),
-				zap.Error(writeErr))
-			retryValue, retryErr := opcua.ConvertWriteValue(cmd.Value, metadataType)
-			if retryErr == nil {
-				retryCtx, retryCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer retryCancel()
-				var retryWriteErr error
-				retryWriteErr = e.opcuaClient.Write(retryCtx, cmd.NodeID, retryValue)
-				if retryWriteErr == nil {
-					e.logger.Info("Write succeeded with metadata type retry",
-						zap.String("node_id", cmd.NodeID),
-						zap.String("metadata_type", metadataType),
-						zap.Any("value", retryValue))
-					e.publishResult(model.WriteResult{
-						NodeID:       cmd.NodeID,
-						RequestID:    cmd.RequestID,
-						Success:      true,
-						WrittenValue: retryValue,
-					})
-					return
-				}
-				e.logger.Error("Write retry with metadata type also failed",
-					zap.String("node_id", cmd.NodeID),
-					zap.Error(retryWriteErr))
-			} else {
-				e.logger.Warn("Metadata type conversion failed in retry",
-					zap.String("node_id", cmd.NodeID),
-					zap.Error(retryErr))
-			}
+		e.lifecycleMu.RLock()
+		cancelLifecycle := e.lifecycleCancel
+		e.lifecycleMu.RUnlock()
+		if cancelLifecycle != nil {
+			cancelLifecycle()
 		}
-		e.logger.Error("Write failed",
-			zap.String("node_id", cmd.NodeID),
-			zap.Any("value", writeValue),
-			zap.Error(writeErr))
-		e.publishResult(model.WriteResult{
-			NodeID:    cmd.NodeID,
-			RequestID: cmd.RequestID,
-			Error:     writeErr.Error(),
-		})
-		return
-	}
-
-	e.logger.Info("Write succeeded",
-		zap.String("node_id", cmd.NodeID),
-		zap.Any("value", writeValue))
-
-	e.publishResult(model.WriteResult{
-		NodeID:       cmd.NodeID,
-		RequestID:    cmd.RequestID,
-		Success:      true,
-		WrittenValue: writeValue,
+		e.publishEnabled.Store(false)
+		e.logger.Info("Writeback engine stopped")
 	})
 }
 
-func typeGroup(t string) int {
-	switch strings.ToLower(t) {
-	case "bool", "boolean":
-		return 1
-	case "int", "int8", "int16", "int32", "int64",
-		"uint", "uint8", "uint16", "uint32", "uint64",
-		"sbyte", "byte", "integer":
-		return 2
-	case "float32", "float64", "float", "double":
-		return 3
-	case "string":
-		return 4
+// handleMessage 只负责协议适配、严格校验和非阻塞入队，不执行 OPC UA I/O。
+func (e *Engine) handleMessage(data []byte) {
+	request, err := decodeIncomingRequest(data)
+	if err != nil {
+		e.logger.Warn("Rejected invalid write request", zap.Error(err))
+		e.publishResult(NewRejectedResult(
+			requestIDFromPayload(data),
+			ErrorCodeInvalidRequest,
+			err.Error(),
+		))
+		return
 	}
-	return 0
+
+	if err := e.executor.TrySubmit(request); err != nil {
+		if code, ok := ErrorCodeOf(err); ok && code == ErrorCodeWriteQueueFull {
+			e.publishResult(NewRejectedResult(request.RequestID, code, "write request queue is full"))
+			return
+		}
+		e.logger.Debug("Write request ignored during shutdown", zap.String("request_id", request.RequestID))
+	}
 }
 
-func isCompatibleTypeGroup(t1, t2 string) bool {
-	if t2 == "" || t2 == "String" {
-		return true
+func (e *Engine) publishResult(result Result) {
+	if !e.publishEnabled.Load() {
+		return
 	}
-	g1, g2 := typeGroup(t1), typeGroup(t2)
-	if g1 == 0 || g2 == 0 {
-		return true
-	}
-	return g1 == g2
-}
-
-func (e *Engine) publishResult(result model.WriteResult) {
 	data, err := json.Marshal(result)
 	if err != nil {
 		e.logger.Error("Failed to marshal write result", zap.Error(err))
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	e.lifecycleMu.RLock()
+	baseCtx := e.lifecycleCtx
+	e.lifecycleMu.RUnlock()
+	ctx, cancel := context.WithTimeout(baseCtx, resultPublishTimeout)
 	defer cancel()
 
 	if err := e.transport.PublishResult(ctx, e.resultSubject, data); err != nil {

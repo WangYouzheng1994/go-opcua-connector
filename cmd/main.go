@@ -8,7 +8,6 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"go-opcua-connector/internal/collector"
@@ -94,8 +93,7 @@ func main() {
 	defer col.Stop()
 
 	if wbTransport != nil {
-		nodeIDPrefix := extractNodeIDPrefix(cfg.Collector.SubscriptionNodes)
-		wbEngine := writeback.NewEngine(opcuaClient, wbTransport, &cfg.Writeback, nodeIDPrefix, logger)
+		wbEngine := writeback.NewEngine(opcuaClient, wbTransport, &cfg.Writeback, logger)
 		if err := wbEngine.Start(ctx); err != nil {
 			logger.Warn("Failed to start writeback engine, writeback disabled", zap.Error(err))
 		} else {
@@ -115,16 +113,6 @@ func main() {
 	// 等待信号（阻塞）
 	<-sigCh
 	logger.Info("Received shutdown signal, stopping...")
-}
-
-func extractNodeIDPrefix(nodes []string) string {
-	for _, node := range nodes {
-		idx := strings.Index(node, ";s=")
-		if idx >= 0 {
-			return node[:idx+3]
-		}
-	}
-	return ""
 }
 
 func loadConfig() (*config.AppConfig, error) {

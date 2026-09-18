@@ -2,8 +2,6 @@
 package model
 
 import (
-	"fmt"
-	"strings"
 	"time"
 )
 
@@ -46,60 +44,6 @@ func NewBatchMessage(points []DataPoint) BatchMessage {
 		Timestamp: nowMs,
 		Values:    values,
 	}
-}
-
-// WriteCommand 回写命令，由外部系统通过消息队列发送
-type WriteCommand struct {
-	// NodeID 目标OPC UA节点ID
-	NodeID string `json:"node_id"`
-	// Value 待写入的原始值，通常为字符串形式，回写时会进行类型转换
-	Value string `json:"value"`
-	// ValueType 期望的目标类型，可选 int32/int64/float32/float64/bool/string
-	// 为空时自动推断：先尝试数值，再尝试布尔，最后作为字符串
-	ValueType string `json:"value_type,omitempty"`
-	// RequestID 请求标识，用于结果关联
-	RequestID string `json:"request_id,omitempty"`
-}
-
-// BatchWriteItem 批量回写命令中的单条（精简字段名，与推送格式对应）
-type BatchWriteItem struct {
-	ID string `json:"id"`
-	V  any    `json:"v"`
-}
-
-// ToWriteCommand 转换为内部 WriteCommand，nodeIDPrefix 用于还原完整节点ID。
-func (b BatchWriteItem) ToWriteCommand(nodeIDPrefix string) WriteCommand {
-	nodeID := b.ID
-	if nodeIDPrefix != "" && !strings.Contains(nodeID, ";s=") {
-		nodeID = nodeIDPrefix + nodeID
-	}
-	value := ""
-	switch v := b.V.(type) {
-	case string:
-		value = v
-	case float64:
-		value = fmt.Sprintf("%v", v)
-	default:
-		value = fmt.Sprintf("%v", v)
-	}
-	return WriteCommand{
-		NodeID: nodeID,
-		Value:  value,
-	}
-}
-
-// WriteResult NATS回写结果
-type WriteResult struct {
-	// NodeID 目标节点ID
-	NodeID string `json:"node_id"`
-	// RequestID 对应的请求标识
-	RequestID string `json:"request_id,omitempty"`
-	// Success 是否成功
-	Success bool `json:"success"`
-	// WrittenValue 实际写入的值
-	WrittenValue any `json:"written_value,omitempty"`
-	// Error 错误信息
-	Error string `json:"error,omitempty"`
 }
 
 // CollectorStats 采集统计信息
